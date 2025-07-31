@@ -106,7 +106,7 @@ if __name__ == "__main__":
     print("\n" + "="*60)
     
     # Pfad zu deiner Excel-Datei
-    file_path = "variable_mapping_new.xlsx"
+    file_path = "variable_mapping_all.xlsx"
     
     # Konvertiere und speichere als CSV
     print(f"\nVerarbeite Datei: {file_path}")
