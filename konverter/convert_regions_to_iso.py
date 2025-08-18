@@ -34,15 +34,16 @@ def convert_regions_to_csv(file_path, sheet_name='region_mapping'):
         not_found=None
     )
     
-    print("Konvertiere zu ISO3-Codes...")
-    df['ISO3'] = cc.convert(
-        names=df['Source_Region'].fillna(''), 
+    # benennen ISO zu Target_Region, weil das der Name der Spalte ist, wie sie vom darauffolgenden Skript benötigt wird
+    print("Konvertiere zu ISO3-Codes (als 'Target_Region')...")
+    df['Target_Region'] = cc.convert(
+        names=df['Source_Region'].fillna(''),
         to='ISO3',
         not_found=None
     )
     
     # Erstelle finale Tabelle mit nur den gewünschten Spalten
-    result_df = df[['Source_Region', 'ISO2', 'ISO3']].copy()
+    result_df = df[['Source_Region', 'ISO2', 'Target_Region']].copy()
     
     # Zeige Ergebnisse
     print(f"\nKonvertierung abgeschlossen!")
@@ -51,7 +52,7 @@ def convert_regions_to_csv(file_path, sheet_name='region_mapping'):
     
     # Zeige nicht konvertierte Einträge
     not_converted = result_df[
-        ((result_df['ISO2'].isna()) | (result_df['ISO3'].isna())) & 
+        ((result_df['ISO2'].isna()) | (result_df['Target_Region'].isna())) & 
         (result_df['Source_Region'].notna()) & 
         (result_df['Source_Region'] != '')
     ]
@@ -64,7 +65,7 @@ def convert_regions_to_csv(file_path, sheet_name='region_mapping'):
     # Zeige Statistiken
     total_entries = len(result_df[result_df['Source_Region'].notna() & (result_df['Source_Region'] != '')])
     converted_iso2 = len(result_df[result_df['ISO2'].notna()])
-    converted_iso3 = len(result_df[result_df['ISO3'].notna()])
+    converted_iso3 = len(result_df[result_df['Target_Region'].notna()])
     
     print(f"\nStatistiken:")
     print(f"  - Gesamte Einträge: {total_entries}")

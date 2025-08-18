@@ -147,6 +147,9 @@ for (file_location, file_name, model), group_of_mappings in grouped_mappings:
                 print("Diese Regionen werden im Original beibehalten. Fügen Sie bei Bedarf Mappings hinzu:")
                 error_log.append("\nWARNUNG: Folgende Regionen wurden gefunden, aber nicht im 'region_mapping' definiert:")
                 error_log.append("Diese Regionen werden im Original beibehalten. Fügen Sie bei Bedarf Mappings hinzu:")
+                # print(unmapped_regions)
+                if unmapped_regions == "nan":
+                    print("Es sind Zeilen ohne Angabe einer Region enthalten")
                 for region_code in sorted(list(unmapped_regions)):
                     print(f"{region_code}")
                     error_log.append(f"{region_code}")
