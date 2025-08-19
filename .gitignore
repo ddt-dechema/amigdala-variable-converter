@@ -1,3 +1,16 @@
+# Virtual Environment
 .venv
-.venv/*
+.venv/s*
 venv/*
+*workspace
+
+# In- & Output folders
+input/*
+output/*
+
+# Testing scripts
+test/*
+*.xlsx
+
+konverter/prism*
+konverter/times*
