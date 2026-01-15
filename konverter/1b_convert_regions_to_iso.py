@@ -1,120 +1,95 @@
 import pandas as pd
 import country_converter as coco
+from pathlib import Path
 
-def convert_regions_to_csv(file_path, sheet_name='region_mapping'):
+# 1. Custom-Mapping
+custom_regions = {
+    "ACE": "Asia (Eastern)",
+    "AEA": "Africa (Eastern)",
+    "ASE": "Asia (Southeast)",
+    "ASO": "Asia (Southern)",
+    "AWE": "Africa (Western)",
+    "CHI": "China",
+    "EUR": "Europe",
+    "NAM": "North America",
+    "LAM": "Latin America",
+    "MEA": "Middle East & Africa"
+}
+
+# 2. converter-Objekt + Funktion
+cc = coco.CountryConverter()
+
+def map_region_name(source_name):
     """
-    Liest Excel-Datei und erstellt eine CSV mit Source_Region, ISO2 und ISO3 Spalten
-    
-    Parameters:
-    file_path: Pfad zur Excel-Datei
-    sheet_name: Name des Arbeitsblatts
+    Prüft zuerst eigene Mapping-Tabelle (custom_regions),
+    dann country_converter, sonst None.
     """
-    
-    # Lade die Excel-Datei
+    if not isinstance(source_name, str) or not source_name.strip():
+        return None
+
+    name = source_name.strip()
+
+    # 1. Eigene Mapping-Tabelle prüfen
+    if name in custom_regions:
+        return custom_regions[name]
+
+    # 2. Mit country_converter versuchen
+    result = cc.convert(name, to='name_short', not_found=None)
+    if result and isinstance(result, str) and result.lower() != 'not found':
+        return result
+
+    # 3. Kein Treffer
+    return None
+
+def convert_regions_to_fullname(file_path, sheet_name='regions'):
+    """
+    Liest Excel-Datei und konvertiert alle Regionen in der Spalte 'source_region'
+    zu ausgeschriebenen Ländernamen.
+    Speichert das Ergebnis als neue Datei: <originalname>_regions_fullname.xlsx
+    """
+
+    # --- Load file ---
     try:
         df = pd.read_excel(file_path, sheet_name=sheet_name)
-        print(f"Excel-Datei erfolgreich geladen. {len(df)} Zeilen gefunden.")
+        print(f"✅ Datei '{file_path}' erfolgreich geladen ({len(df)} Zeilen).")
     except Exception as e:
-        print(f"Fehler beim Laden der Datei: {e}")
-        return None
-    
-    # Überprüfe ob die erforderlichen Spalten vorhanden sind
-    if 'Source_Region' not in df.columns:
-        print("Fehler: Spalte 'Source_Region' nicht gefunden!")
-        return None
-    
-    # Initialisiere den Country Converter
-    cc = coco.CountryConverter()
-    
-    # Erstelle neue Spalten mit ISO2 und ISO3 Codes
-    print("Konvertiere zu ISO2-Codes...")
-    df['ISO2'] = cc.convert(
-        names=df['Source_Region'].fillna(''), 
-        to='ISO2',
-        not_found=None
-    )
-    
-    # benennen ISO zu Target_Region, weil das der Name der Spalte ist, wie sie vom darauffolgenden Skript benötigt wird
-    print("Konvertiere zu ISO3-Codes (als 'Target_Region')...")
-    df['Target_Region'] = cc.convert(
-        names=df['Source_Region'].fillna(''),
-        to='ISO3',
-        not_found=None
-    )
-    
-    # Erstelle finale Tabelle mit nur den gewünschten Spalten
-    result_df = df[['Source_Region', 'ISO2', 'Target_Region']].copy()
-    
-    # Zeige Ergebnisse
-    print(f"\nKonvertierung abgeschlossen!")
-    print("\nErste 10 Zeilen:")
-    print(result_df.head(10))
-    
-    # Zeige nicht konvertierte Einträge
-    not_converted = result_df[
-        ((result_df['ISO2'].isna()) | (result_df['Target_Region'].isna())) & 
-        (result_df['Source_Region'].notna()) & 
-        (result_df['Source_Region'] != '')
-    ]
-    
-    if not not_converted.empty:
-        print(f"\nWarnung: Einige Einträge konnten nicht konvertiert werden:")
-        for country in not_converted['Source_Region'].unique():
-            print(f"  - '{country}'")
-    
-    # Zeige Statistiken
-    total_entries = len(result_df[result_df['Source_Region'].notna() & (result_df['Source_Region'] != '')])
-    converted_iso2 = len(result_df[result_df['ISO2'].notna()])
-    converted_iso3 = len(result_df[result_df['Target_Region'].notna()])
-    
-    print(f"\nStatistiken:")
-    print(f"  - Gesamte Einträge: {total_entries}")
-    print(f"  - ISO2 erfolgreich: {converted_iso2} ({converted_iso2/total_entries*100:.1f}%)")
-    print(f"  - ISO3 erfolgreich: {converted_iso3} ({converted_iso3/total_entries*100:.1f}%)")
-    
-    # Speichere als CSV
-    output_file = file_path.replace('.xlsx', '_iso_codes.csv')
-    result_df.to_csv(output_file, index=False, encoding='utf-8')
-    print(f"\nErgebnisse gespeichert als CSV: {output_file}")
-    
-    return result_df
+        print(f"❌ FEHLER beim Laden der Datei: {e}")
+        return
 
-def test_conversion_examples():
-    """Testet die Konvertierung mit einigen Beispielen"""
-    cc = coco.CountryConverter()
-    
-    test_countries = [
-        'Germany', 'USA', 'United Kingdom', 'China', 'Russia', 
-        'South Korea', 'Iran', 'Venezuela', 'Czech Republic'
-    ]
-    
-    print("Test-Konvertierungen:")
-    print("Land\t\t\tISO2\tISO3")
-    print("-" * 50)
-    
-    for country in test_countries:
-        iso2 = cc.convert(country, to='ISO2')
-        iso3 = cc.convert(country, to='ISO3')
-        print(f"{country:<20}\t{iso2}\t{iso3}")
+    if 'source_region' not in df.columns:
+        print("❌ FEHLER: Spalte 'source_region' nicht gefunden!")
+        return
 
-# Hauptskript
+
+    print("🌍 Konvertiere 'source_region' → ausgeschriebene Ländernamen ('full name') ...")
+    
+    df['target_region'] = df['source_region'].apply(map_region_name)
+
+    # --- Reporting ---
+    total = len(df[df['source_region'].notna() & (df['source_region'] != '')])
+    converted = len(df[df['target_region'].notna()])
+
+    print(f"\n📊 Statistik:")
+    print(f"  • Gesamt: {total}")
+    print(f"  • Erfolgreich konvertiert: {converted} ({converted/total*100 if total>0 else 0:.1f}%)")
+
+    missing = df[df['target_region'].isna() & df['source_region'].notna()]
+    if not missing.empty:
+        print(f"\n⚠️  WARNUNG: {len(missing)} Regionen konnten nicht zugeordnet werden:")
+        for name in sorted(missing['source_region'].unique()):
+            print(f"  - {name}")
+
+    # --- Save output as NEW file ---
+    input_path = Path(file_path)
+    output_file = input_path.with_name(input_path.stem + "_regions_fullname.xlsx")
+
+    df.to_excel(output_file, sheet_name='regions_fullname', index=False)
+
+    print(f"\n💾 Neue Datei gespeichert als: {output_file}\n")
+    print("✅ Fertig!")
+
 if __name__ == "__main__":
-    print("=== Länder zu ISO-Codes Konverter ===\n")
-    
-    # Teste einige Konvertierungen als Beispiel
-    test_conversion_examples()
-    
-    print("\n" + "="*60)
-    
-    # Pfad zu deiner Excel-Datei
-    file_path = "variable_mapping_all.xlsx"
-    
-    # Konvertiere und speichere als CSV
-    print(f"\nVerarbeite Datei: {file_path}")
-    df_result = convert_regions_to_csv(file_path)
-    
-    if df_result is not None:
-        print("\n✅ Fertig! Die CSV-Datei enthält:")
-        print("   - Source_Region: Original-Ländernamen")
-        print("   - ISO2: 2-stellige ISO-Codes (DE, US, etc.)")
-        print("   - ISO3: 3-stellige ISO-Codes (DEU, USA, etc.)")
+    print("=== Regionen-Umbenennung zu ausgeschriebenen Ländernamen ===\n")
+    file_path = "dictionary_dataexplorer_variables_translation.xlsm"  # oder deine gewünschte Datei
+    convert_regions_to_fullname(file_path)
+

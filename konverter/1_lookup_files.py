@@ -9,7 +9,7 @@ BASE_DIR = Path(__file__).resolve().parent
 
 # Eingabe/ Ausgabe relativ zum Skript (eine Ebene über BASE_DIR)
 INPUT_DIR = BASE_DIR.parent / 'input' / 'POC_2.0_2025.10'
-OUTPUT_EXCEL = BASE_DIR.parent / 'overview_input_files.xlsx'
+OUTPUT_EXCEL = BASE_DIR.parent / 'overview_input_files_unsorted.xlsx'
 # ------------------------------------------
 
 def get_excel_sheets_and_columns(filepath: Path):
