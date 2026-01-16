@@ -1,31 +1,31 @@
 #%%
 import pandas as pd
-import os
-import sys
-import time
+import os, sys,  time
 from collections import defaultdict, Counter
 from pathlib import Path
 from colorama import Fore, Style, init
 init(autoreset=True)
 
+start_time = time.time()
+
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
-start_time = time.time()
+# Paths are now stored in config.py
+from config import * 
 
-# Zentrale Pfade
 # MODEL_RESULTS_FOLDER = 'input\\POC_2.0_2025.10'  # Pfad zu den Modelldateien
-MODEL_RESULTS_FOLDER = 'input\\POC_1.0'  # Pfad zu den Modelldateien
-MAPPING_FILE_PATH = 'overview_files_variables_test.xlsx'
+# MODEL_RESULTS_FOLDER = r'..\\input\\POC_1.0'  # Pfad zu den Modelldateien
+# MAPPING_FILE_PATH = r'..\\overview_files_variables_test.xlsx'
 # MAPPING_FILE_PATH = 'overview_files_variables.xlsx'
-DICTIONARY_FILE_PATH = 'dictionary_dataexplorer_variables_translation-local.xlsm'
+# DICTIONARY_FILE_PATH = r'..\\dictionary_dataexplorer_variables_translation-local.xlsm'
 
 # ============================================================
 # 1. Dictionary-Dateien laden
 # ============================================================
 
-print(f"Lade Dictionary aus: {DICTIONARY_FILE_PATH}")
+print(f"Loading dictionary from: {DICTIONARY_FILE_PATH}")
 
 try:
     dict_var = pd.read_excel(DICTIONARY_FILE_PATH, sheet_name='variables')
@@ -264,7 +264,7 @@ for (file_location, file_name, model), group_of_mappings in grouped_mappings:
         else:
             df_iamc['unit'] = 'undefined'
 
-        # apply dictionary renaming for regions & Scenarios
+        # apply dictionary renaming for regions & Scenarios-dictionary
         df_iamc['region'] = df_iamc['region'].map(region_dict).fillna(df_iamc['region'])
         df_iamc['scenario'] = df_iamc['scenario'].map(scenario_dict).fillna(df_iamc['scenario'])
 
@@ -298,7 +298,7 @@ for (file_location, file_name, model), group_of_mappings in grouped_mappings:
 
 print(Fore.GREEN + Style.BRIGHT + "\n✅ All files processed." + Style.RESET_ALL)
 
-with open("output/error_log.txt", "w", encoding="utf-8") as f:
+with open(r"output//error_log.txt", "w", encoding="utf-8") as f:
     for line in error_log:
         f.write(str(line) + "\n")
 
