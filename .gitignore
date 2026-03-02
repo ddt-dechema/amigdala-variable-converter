@@ -5,8 +5,8 @@ venv/*
 *workspace
 
 # In- & Output folders
-input/*
-output/*
+input/POC*
+output/POC*
 
 # Testing scripts
 test/*

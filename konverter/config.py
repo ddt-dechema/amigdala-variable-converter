@@ -4,8 +4,12 @@
 # MODEL_RESULTS_FOLDER = r'..\\input\\POC_1.0'  # Pfad zu den Modelldateien
 
 # MODEL_RESULTS_FOLDER = r'input\\POC_2.0'  # Pfad zu den Modelldateien
-MODEL_RESULTS_FOLDER = r'..\\input\\POC_2.0_2025.10'  # Pfad zu den Modelldateien
-MAPPING_FILE_PATH = r'..\\overview_files_variables_short.xlsx'
+
+# relevant für 1_lookup_files
+MODEL_RESULTS_FOLDER = r'..\\input\\Plastic POC 2.0_2025.10'  # Pfad zu den Modelldateien
+
+# relevant für 2_mapping_utils
+MAPPING_FILE_PATH = r'..\\overview_files.xlsx'
 # MAPPING_FILE_PATH = 'overview_files_variables.xlsx'
 DICTIONARY_FILE_PATH = r'..\\dictionary_dataexplorer_variables_translation-local.xlsm'
 OUTPUT_FOLDER = r'..\\output'  # Ordner für Ausgabedateien
