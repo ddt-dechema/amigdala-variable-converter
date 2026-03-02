@@ -1,7 +1,8 @@
 #%%
 import pandas as pd
-import os, sys,  time
-from collections import defaultdict, Counter
+import os, sys, time, gc
+import numpy as np
+# from collections import defaultdict, Counter
 from pathlib import Path
 from colorama import Fore, Style, init
 init(autoreset=True)
@@ -9,75 +10,127 @@ init(autoreset=True)
 start_time = time.time()
 
 # ============================================================
-# CONFIGURATION
+# CONFIGURATION & COLUMN ALIASES
 # ============================================================
 
 # Paths are now stored in config.py
 from config import * 
 
-# MODEL_RESULTS_FOLDER = 'input\\POC_2.0_2025.10'  # Pfad zu den Modelldateien
-# MODEL_RESULTS_FOLDER = r'..\\input\\POC_1.0'  # Pfad zu den Modelldateien
-# MAPPING_FILE_PATH = r'..\\overview_files_variables_test.xlsx'
-# MAPPING_FILE_PATH = 'overview_files_variables.xlsx'
-# DICTIONARY_FILE_PATH = r'..\\dictionary_dataexplorer_variables_translation-local.xlsm'
+COLUMN_ALIASES = {
+    "scenario": ["scenario", "Scenario", "Scenario name", "Source Scenario", "scen", "SCEN1"],
+    "region":   ["region", "Region", "Region name", "Source Region", "area", "AREA"],
+    "year":     ["year", "Year", "TIME", "Source Year", "Period"],
+    "value":    ["value", "Value", "Source Value", "VAL", "growth"],
+    "unit":     ["Unit", "unit"],
+}
 
+# ============================================================
+# HELPER FUNCTIONS
+# ============================================================
+
+def check_dictionary_entries(df, column, dictionary, label, error_log):
+    """
+    Prüft, ob Werte aus df[column] im dictionary vorkommen.
+    Meldet fehlende Werte (Case- & Whitespace-insensitiv),
+    listet sie zeilenweise im Log (copy-paste-freundlich) und färbt farbig ein.
+    """
+    if column not in df.columns:
+        return
+
+    # Werte bereinigen (String, Trim, Case)
+    values = df[column].dropna().astype(str).str.strip()
+    dict_keys = {k.strip().lower() for k in dictionary.keys() if isinstance(k, str)}
+    missing = sorted({v for v in values if v.lower() not in dict_keys and v})
+
+    if missing:
+        msg_header = f"[Dictionary] {len(missing)} {label} not found in Dictionary:"
+        print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
+        error_log.append(msg_header)
+        for val in missing:
+            line = f"  - {val}"
+            print(line)
+            error_log.append(line)
+
+def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True):
+    """
+    Maps a DataFrame column via a provided dictionary and logs missing mappings.
+    Optionally drops unmapped rows for strict filtering.
+
+    Parameters
+    ----------
+    df : pandas.DataFrame
+        Input DataFrame
+    column : str
+        Column name in df to be mapped
+    mapping_dict : dict
+        Dictionary for mapping
+    label : str
+        Descriptive label for logging (e.g. 'Region', 'Scenario')
+    error_log : list
+        Global error log list
+    drop_unmapped : bool, optional
+        If True, removes rows with unmapped entries (default True)
+
+    Returns
+    -------
+    pandas.Series
+        The mapped series (NaNs removed if drop_unmapped=True)
+    """
+    if column not in df.columns:
+        msg = f"[Dictionary] Column '{column}' not found in DataFrame for mapping {label}."
+        print(Fore.YELLOW + msg + Style.RESET_ALL)
+        error_log.append(msg)
+        return pd.Series(dtype='string')
+
+    mapped = df[column].map(mapping_dict)
+
+    # find missing
+    missing_items = df.loc[mapped.isna(), column].unique().tolist()
+    if missing_items:
+        msg_header = f"[Dictionary] {len(missing_items)} {label} entries not found in dictionary:"
+        print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
+        error_log.append(msg_header)
+        for val in sorted(missing_items):
+            line = f"  - {val}"
+            print(line)
+            error_log.append(line)
+
+    if drop_unmapped:
+        df = df.loc[mapped.notna()].copy()
+        mapped = mapped.dropna()
+
+    return mapped
+
+def load_mapping_dict(file, sheet, src_col, tgt_col):
+    df = pd.read_excel(file, sheet_name=sheet, usecols=[src_col, tgt_col])
+    if not {src_col, tgt_col}.issubset(df.columns):
+        raise KeyError(f"Missing columns in '{sheet}'. Expected {src_col} and {tgt_col}.")
+    return pd.Series(df[tgt_col].values, index=df[src_col]).to_dict()
+            
 # ============================================================
 # 1. Dictionary-Dateien laden
 # ============================================================
 
 print(f"Loading dictionary from: {DICTIONARY_FILE_PATH}")
 
-try:
-    dict_var = pd.read_excel(DICTIONARY_FILE_PATH, sheet_name='variables')
-    dict_reg = pd.read_excel(DICTIONARY_FILE_PATH, sheet_name='regions')
-    dict_mod = pd.read_excel(DICTIONARY_FILE_PATH, sheet_name='models')
-    dict_scen = pd.read_excel(DICTIONARY_FILE_PATH, sheet_name='scenarios')
-    # (Optional für später) dict_units = pd.read_excel(DICTIONARY_FILE_PATH, sheet_name='units')
-except Exception as e:
-    raise RuntimeError(f"Fehler beim Laden der Dictionary-Datei: {e}")
+dict_variable = load_mapping_dict(DICTIONARY_FILE_PATH, 'variables', 'names mapping', 'DE variable name')
+dict_region   = load_mapping_dict(DICTIONARY_FILE_PATH, 'regions', 'source_region', 'target_region')
+dict_model    = load_mapping_dict(DICTIONARY_FILE_PATH, 'models', 'source_models', 'target_models')
+dict_scenario = load_mapping_dict(DICTIONARY_FILE_PATH, 'scenarios', 'source_scenario', 'target_scenario')
+dict_unit = load_mapping_dict(DICTIONARY_FILE_PATH, 'units', 'source_unit', 'target_unit')
 
-# --- Variablen ---
-if not {'DE variable name', 'names mapping'}.issubset(dict_var.columns):
-    raise KeyError("Fehlende Spalten im Sheet 'variables': erwartet 'names mapping' und 'DE variable name'")
-variable_dict = pd.Series(dict_var['DE variable name'].values,
-                          index=dict_var['names mapping']).to_dict()
 
-# --- Regionen ---
-if not {'source_region', 'target_region'}.issubset(dict_reg.columns):
-    raise KeyError("Fehlende Spalten im Sheet 'region': erwartet 'source_region' und 'target_region'")
-region_dict = pd.Series(dict_reg['target_region'].values,
-                        index=dict_reg['source_region']).to_dict()
-
-# --- Modelle ---
-if not {'source_models', 'target_models'}.issubset(dict_mod.columns):
-    raise KeyError("Fehlende Spalten im Sheet 'models': erwartet 'source_models' und 'target_models'")
-model_dict = pd.Series(dict_mod['target_models'].values,
-                       index=dict_mod['source_models']).to_dict()
-
-# --- Szenarien ---
-if not {'source_scenario', 'target_scenario'}.issubset(dict_scen.columns):
-    raise KeyError("Fehlende Spalten im Sheet 'scenarios': erwartet 'source_scenario' und 'target_scenario'")
-scenario_dict = pd.Series(dict_scen['target_scenario'].values,
-                         index=dict_scen['source_scenario']).to_dict()
-
-print(f"{len(variable_dict)} variables loaded from dictionary.")
-print(f"{len(region_dict)} regions loaded from dictionary.")
-print(f"{len(model_dict)} models loaded from dictionary.")
-print(f"{len(scenario_dict)} scenarios loaded from dictionary.\n")
+print(f"{len(dict_variable)} variables loaded from dictionary.")
+print(f"{len(dict_region)} regions loaded from dictionary.")
+print(f"{len(dict_model)} models loaded from dictionary.")
+print(f"{len(dict_scenario)} scenarios loaded from dictionary.\n")
+print(f"{len(dict_unit)} units loaded from dictionary.\n")
 
 # ============================================================
 # 2. Initialisierung & Hilfsklassen
 # ============================================================
 
 error_log = []
-unmapped_records = []
-
-# --- Units & Normalisierung ---
-try:
-    import pint
-    _UREG = pint.UnitRegistry()
-except Exception:
-    _UREG = None
 
 # ============================================================
 # 3. Mapping-Datei laden
@@ -85,7 +138,7 @@ except Exception:
 
 print(f"Reading dictionary file: {MAPPING_FILE_PATH}")
 try:
-    df_mapping_full = pd.read_excel(MAPPING_FILE_PATH, sheet_name='variable_mapping').fillna('')
+    df_mapping_full = pd.read_excel(MAPPING_FILE_PATH, sheet_name='files').fillna('')
     FIRST_MAPPING_SHEET_NAME = pd.ExcelFile(MAPPING_FILE_PATH).sheet_names[0]
 except FileNotFoundError:
     print(f"ERROR: Mapping-File '{MAPPING_FILE_PATH}' not found.")
@@ -99,206 +152,244 @@ grouped_mappings = df_mapping_full.groupby(['File location', 'File name', 'Sourc
 print(f"\n{len(grouped_mappings)} unique files for processing found.")
 
 # ============================================================
-# 5. Haupt-Schleife über Dateien
+# TO DO next steps:
+# model_groups = df_mapping_full.groupby('Source model')
+
+
 # ============================================================
 
-for (file_location, file_name, model), group_of_mappings in grouped_mappings:
-    config = group_of_mappings.iloc[0]
-    # INPUT_FILE_PATH = os.path.join('input\\POC_2.0_2025.10', file_location, file_name)
-    INPUT_FILE_PATH = os.path.join(MODEL_RESULTS_FOLDER, file_location, file_name)
-    output_filename = f"pyam_{model}-{os.path.splitext(file_name)[0]}.xlsx"
-    OUTPUT_FILE_PATH = os.path.join('output', output_filename)
 
-    print(Fore.MAGENTA + Style.BRIGHT + f"\n--- Starting with process for: {file_name} ---" + Style.RESET_ALL)
-    error_log.append(f"\n--- {file_name} ---")
+# ============================================================
+# current time for runtime measurement
+# ============================================================
+cur_time = time.time()
+elapsed = cur_time - start_time
+print(f"\n⏱️ Runtime so far: {elapsed:.2f} Seconds\n")
 
-    # --------------------------------------------------------------------
-    # 5.1. Datei einlesen
-    # --------------------------------------------------------------------
-    sheet_name = config.get('Sheet name', 0) or 0
-    try:
-        if file_name.lower().endswith('.xlsx'):
-            df_input = pd.read_excel(INPUT_FILE_PATH, sheet_name=sheet_name)
-        elif file_name.lower().endswith('.csv'):
-            sep = config['Separator'] if config['Separator'] else ','
-            df_input = pd.read_csv(INPUT_FILE_PATH, sep=sep, low_memory=False)
-        else:
-            print("WARNING: Unknown Format – skipped.")
-            error_log.append(f"WARNING: Unknown Format: {file_name}")
+# ============================================================
+# 5. Process all files grouped by model
+# ============================================================
+
+# Group only by model so all files of one model are collected together
+model_groups = df_mapping_full.groupby('Source model')
+print(f"\n{len(model_groups)} unique models for processing found.")
+
+for model, model_group in model_groups:
+    print(Fore.CYAN + Style.BRIGHT + f"\n=== Processing model: {model} ===" + Style.RESET_ALL)
+    error_log.append(f"\n=== {model} ===")
+
+    df_model_all = []  # collect IAMC data for each file of this model
+
+    # --------------------------------------------------------
+    # Loop through all files belonging to this model
+    # --------------------------------------------------------
+    for _, group_row in model_group.iterrows():
+        file_location = group_row['File location']
+        file_name     = group_row['File name']
+        config        = group_row
+
+        INPUT_FILE_PATH = os.path.join(MODEL_RESULTS_FOLDER, file_location, file_name)
+        print(Fore.MAGENTA + Style.BRIGHT + f"\n--- File: {file_name} ---" + Style.RESET_ALL)
+        error_log.append(f"\n--- {file_name} ---")
+
+        # ----------------------------------------------------
+        # Read source file (.xlsx or .csv)
+        # ----------------------------------------------------
+        sheet_name = config.get('Sheet name', 0) or 0
+        try:
+            if file_name.lower().endswith('.xlsx'):
+                df_input = pd.read_excel(
+                    INPUT_FILE_PATH,
+                    sheet_name=sheet_name,
+                    usecols=lambda col: col not in ["Unnamed: 0"],
+                    engine="openpyxl"
+                )
+            elif file_name.lower().endswith('.csv'):
+                sep = config['Separator'] if config['Separator'] else ','
+                df_input = pd.read_csv(INPUT_FILE_PATH, sep=sep, low_memory=False, engine="c", dtype_backend="numpy_nullable")
+            else:
+                msg = f"WARNING: Unknown Format – skipped: {file_name}"
+                print(msg)
+                error_log.append(msg)
+                continue
+            print(f"File successfully loaded: {INPUT_FILE_PATH}")
+        except Exception as e:
+            msg = f"ERROR reading file {file_name}: {e}"
+            print(msg)
+            error_log.append(msg)
             continue
-        print(f"File successfully loaded: {INPUT_FILE_PATH}")
-    except Exception as e:
-        print(f"ERROR reading file: {e}")
-        error_log.append(f"ERROR reading file: {file_name} – {e}")
-        continue
 
-    # --------------------------------------------------------------------
-    # 5.2. Variablen vorbereiten
-    # --------------------------------------------------------------------
-    def _to_clean_string(series: pd.Series) -> pd.Series:
-        return series.astype('string').fillna('').str.strip()
+        # ----------------------------------------------------
+        # 5.1.2  Standardize column names using aliases
+        # ----------------------------------------------------
+        for canonical, variants in COLUMN_ALIASES.items():
+            for variant in variants:
+                if variant in df_input.columns:
+                    df_input.rename(columns={variant: canonical}, inplace=True)
+                    break
+        found_cols = [c for c in ["scenario", "region", "year", "value", "unit"] if c in df_input.columns]
+        print(f"Standardized columns: {found_cols}")
 
-    # --- Variable-Spalten (können eine oder mehrere sein) ---
-    mapping_source_columns = str(config.get('Variable column', '')).strip()
+        # ----------------------------------------------------
+        # Variable column preparation
+        # ----------------------------------------------------
+        def _to_clean_string(series: pd.Series) -> pd.Series:
+            return series.fillna('').astype('string', copy=False).str.strip()
 
-    try:
-        # Mehrfachspalten-Angabe? z. B. "Variable|Commodity"
-        if '|' in mapping_source_columns:
-            columns_to_combine = [col.strip() for col in mapping_source_columns.split('|')]
+        mapping_source_columns = str(config.get('Variable column', '')).strip()
 
-            # Existenz prüfen
-            missing_cols = [c for c in columns_to_combine if c not in df_input.columns]
-            if missing_cols:
-                raise KeyError(f"Columns: {missing_cols} not found.")
+        try:
+            if '|' in mapping_source_columns:
+                columns_to_combine = [col.strip() for col in mapping_source_columns.split('|')]
+                missing_cols = [c for c in columns_to_combine if c not in df_input.columns]
+                if missing_cols:
+                    raise KeyError(f"Columns {missing_cols} not found.")
+                cleaned = df_input[columns_to_combine].astype('string').fillna('').apply(lambda x: '|'.join(x), axis=1)
+                df_input['original_variable'] = cleaned.str.strip()
+                del cleaned; gc.collect()
+            else:
+                col = mapping_source_columns
+                if col not in df_input.columns:
+                    raise KeyError(f"Column '{col}' not found.")
+                df_input['original_variable'] = df_input[col].astype('string').fillna('').str.strip()
+        except KeyError as e:
+            msg = f"ERROR: {e}. Skipping file {file_name}"
+            print(msg)
+            error_log.append(msg)
+            continue
 
-            # Kombination zu einer zusammengesetzten Variablenbezeichnung
-            cleaned = df_input[columns_to_combine].astype('string').fillna('').apply(lambda x: '|'.join(x), axis=1)
-            df_input['original_variable'] = cleaned.str.strip()
+        # ----------------------------------------------------
+        # Dictionary mapping
+        # ----------------------------------------------------
+        df_input['variable'] = map_strict(df_input, 'original_variable', dict_variable, 'Variables', error_log)
+        df_input['region']   = map_strict(df_input, 'region', dict_region, 'Regions', error_log)
+        df_input['scenario'] = map_strict(df_input, 'scenario', dict_scenario, 'Scenarios', error_log)
+        df_input['unit']     = map_strict(df_input, 'unit', dict_unit, 'Units', error_log)
 
-        else:
-            col = mapping_source_columns
-            if col not in df_input.columns:
-                raise KeyError(f"Column '{col}' not found.")
-            df_input['original_variable'] = df_input[col].astype('string').fillna('').str.strip()
+        df_input.dropna(subset=['variable', 'region', 'scenario'], inplace=True)
+        if df_input.empty:
+            msg = f"INFO: No valid data for {file_name}. Skipped."
+            print(Fore.RED + msg + Style.RESET_ALL)
+            error_log.append(msg)
+            continue
 
-    except KeyError as e:
-        print(f"ERROR: {e}. Skipped.")
-        error_log.append(f"ERROR: {e}. Skipped. {file_name}")
-        continue
-
-    # Anschließend Variablen nach Dictionary übersetzen
-    df_input['variable'] = df_input['original_variable'].map(variable_dict)
-
-    # Fehlende Variablen erfassen
-    missing_vars = df_input.loc[df_input['variable'].isna(), 'original_variable'].unique()
-    if len(missing_vars) > 0:
-        msg_header = f"[Dictionary] {len(missing_vars)} Variables not found in Dictionary:"
-        print(Fore.RED + Style.BRIGHT + msg_header + Style.RESET_ALL)
-        error_log.append(msg_header)
-        for v in sorted(missing_vars):
-            line = f"  - {v}"
-            print(line)
-            error_log.append(line)
-
-
-    # ============================================================
-    # Zusätzliche Prüfung: Regionen, Szenarien, Modelle, Variablen (je Zeile + farbig)
-    # ============================================================
-
-    def check_dictionary_entries(df, column, dictionary, label, error_log):
-        """
-        Prüft, ob Werte aus df[column] im dictionary vorkommen.
-        Meldet fehlende Werte (Case- & Whitespace-insensitiv),
-        listet sie zeilenweise im Log (copy-paste-freundlich) und färbt farbig ein.
-        """
-        if column not in df.columns:
-            return
-
-        # Werte bereinigen (String, Trim, Case)
-        values = df[column].dropna().astype(str).str.strip()
-        dict_keys = {k.strip().lower() for k in dictionary.keys() if isinstance(k, str)}
-        missing = sorted({v for v in values if v.lower() not in dict_keys and v})
-
-        if missing:
-            msg_header = f"[Dictionary] {len(missing)} {label} not found in Dictionary:"
-            print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
-            error_log.append(msg_header)
-            for val in missing:
-                line = f"  - {val}"
-                print(line)
-                error_log.append(line)
-
-
-    # --- Regionen prüfen ---
-    if config.get('Source Region'):
-        check_dictionary_entries(df_input, config['Source Region'], region_dict, 'Regionen', error_log)
-
-    # --- Szenarien prüfen ---
-    if config.get('Source Scenario'):
-        check_dictionary_entries(df_input, config['Source Scenario'], scenario_dict, 'Szenarien', error_log)
-
-    # --- Modelle prüfen ---
-    if model not in model_dict:
-        msg_header = "[Dictionary] Source model nicht im Dictionary gefunden:"
-        print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
-        model_line = f"  - {model}"
-        print(model_line)
-        error_log.append(msg_header)
-        error_log.append(model_line)
-
-
-
-    # alle Zeilen werden gelöscht, deren Variable nicht im Dictionary gefunden wurde
-    df_input.dropna(subset=['variable'], inplace=True)
-    if df_input.empty:
-        print("INFO: No valid data after mapping. No output created.")
-        continue
-
-    # --------------------------------------------------------------------
-    # 5.3. Transformation nach IAMC-Format
-    # --------------------------------------------------------------------
-    print("Transform files into IAMC-format ...")
-
-    try:
+        # ----------------------------------------------------
+        # Transformation to IAMC format
+        # ----------------------------------------------------
+        print("Transforming to IAMC-format ...")
         data_for_iamc = {
-            'scenario': df_input[config['Source Scenario']],
-            'region': df_input[config['Source Region']],
-            'year': df_input[config['Source Year']],
-            'value': df_input[config['Source Value']],
+            'scenario': df_input['scenario'],
+            'region':   df_input['region'],
+            'unit':     df_input['unit'],
+            'year':     df_input['year'],
+            'value':    df_input['value'],
             'variable': df_input['variable']
         }
         df_iamc = pd.DataFrame(data_for_iamc)
 
-        # Modelle
-        df_iamc['model'] = str(model)
-        if model in model_dict:
-            df_iamc['model'] = model_dict[model]
-        else:
+        df_iamc['model'] = dict_model.get(model, model)
+        if model not in dict_model:
             msg = f"WARNING: Source model '{model}' not found in dictionary."
             print(msg)
             error_log.append(msg)
-           
-        # Units - not yet implemented
-        if config['Source Unit'] and config['Source Unit'] in df_input.columns:
-            df_iamc['unit'] = df_input[config['Source Unit']]
-        else:
-            df_iamc['unit'] = 'undefined'
 
-        # apply dictionary renaming for regions & Scenarios-dictionary
-        df_iamc['region'] = df_iamc['region'].map(region_dict).fillna(df_iamc['region'])
-        df_iamc['scenario'] = df_iamc['scenario'].map(scenario_dict).fillna(df_iamc['scenario'])
+        df_model_all.append(df_iamc)
+        del df_input, df_iamc; gc.collect()
 
-    except KeyError as e:
-        print(f"ERROR during transformation: {e}")
-        error_log.append(f"ERROR during transformation: {file_name} – {e}")
+    # --------------------------------------------------------
+    # Combine and save one result per model
+    # --------------------------------------------------------
+    if not df_model_all:
+        print(Fore.YELLOW + f"No valid files for model {model}, skipping." + Style.RESET_ALL)
         continue
 
-    # --------------------------------------------------------------------
-    # 5.4. Pivotieren & Speichern
-    # --------------------------------------------------------------------
-    print("Pivoting & Saving ...")
+    df_model_combined = pd.concat(df_model_all, ignore_index=True, copy=False)
 
+    # --------------------------------------------------------
+    # Detect duplicates and mark them clearly
+    # --------------------------------------------------------
+    dup_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'year']
+    dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
+
+    if dupe_mask.any():
+        dup_count = dupe_mask.sum()
+        msg = f"[Check] Found {dup_count} duplicate rows for model {model}. Identical-valued duplicates will be removed; differing ones will be suffixed."
+        print(Fore.YELLOW + msg + Style.RESET_ALL)
+        error_log.append(msg)
+
+        # identify duplicates grouped by keys
+        grouped_dupes = df_model_combined[dupe_mask].groupby(dup_cols, dropna=False)
+
+        rows_to_drop = set()
+        rows_to_rename = []
+
+        for key, group in grouped_dupes:
+            # If all 'value' entries in group are identical, mark all but first for deletion
+            if group['value'].nunique() == 1:
+                rows_to_drop.update(group.index[1:])
+            else:
+                # assign incremental IDs for visible duplicates
+                for i, idx in enumerate(group.index, start=1):
+                    rows_to_rename.append((idx, f"dup_{group.iloc[i-1]['region']}_{i}"))
+
+        # delete exact duplicates
+        if rows_to_drop:
+            df_model_combined.drop(index=list(rows_to_drop), inplace=True)
+            msg = f"Removed {len(rows_to_drop)} rows with identical duplicates for model {model}."
+            print(Fore.GREEN + msg + Style.RESET_ALL)
+            error_log.append(msg)
+
+        # rename only the true differing duplicates
+        if rows_to_rename:
+            for idx, new_name in rows_to_rename:
+                df_model_combined.at[idx, 'region'] = new_name
+
+            msg = f"Renamed {len(rows_to_rename)} remaining duplicate rows with 'dup_' prefix for model {model}."
+            print(Fore.GREEN + msg + Style.RESET_ALL)
+            error_log.append(msg)
+    else:
+        msg = f"[Check] No duplicates found for model {model}."
+        print(msg)
+        error_log.append(msg)
+
+    # --------------------------------------------------------
+    # 5.4. Pivotieren & Speichern (safe even with renamed duplicates)
+    # --------------------------------------------------------
     try:
         df_output = (
-            df_iamc.pivot_table(index=['model', 'scenario', 'region', 'variable', 'unit'],
-                                columns='year', values='value', aggfunc='sum')
+            df_model_combined
+            .pivot(index=['model', 'scenario', 'region', 'variable', 'unit'],
+                columns='year', values='value')
             .reset_index()
         )
-        os.makedirs(os.path.dirname(OUTPUT_FILE_PATH), exist_ok=True)
-        df_output.to_excel(OUTPUT_FILE_PATH, index=False, sheet_name='pyam_data')
-        print(f"Result saved: {OUTPUT_FILE_PATH}")
+        df_output.columns = [str(col) for col in df_output.columns]
+
+        out_file = os.path.join(OUTPUT_FOLDER, f"pyam_{model}.xlsx")
+        os.makedirs(os.path.dirname(out_file), exist_ok=True)
+        df_output.to_excel(out_file, index=False, sheet_name='pyam_data')
+
+        print(Fore.GREEN + f"✅ Saved combined (with dup markers) file for model: {model}" + Style.RESET_ALL)
+
     except Exception as e:
-        print(f"ERROR during pivoting/saving: {e}")
-        error_log.append(f"ERROR during pivoting: {file_name} – {e}")
+        msg = f"ERROR during pivot/save for model {model}: {e}"
+        print(Fore.RED + msg + Style.RESET_ALL)
+        error_log.append(msg)
         continue
 
+    # Clean up memory
+    del df_output, df_model_all, df_model_combined
+    gc.collect()
+
+    cur_time = time.time()
+    print(f"\n⏱️ Runtime so far: {cur_time - start_time:.2f} Seconds\n")
+    
 # ============================================================
 # 6. Abschluss & Logs
 # ============================================================
 
 print(Fore.GREEN + Style.BRIGHT + "\n✅ All files processed." + Style.RESET_ALL)
 
-with open(r"output//error_log.txt", "w", encoding="utf-8") as f:
+with open(os.path.join(OUTPUT_FOLDER,'error_log.txt'), "w", encoding="utf-8") as f:
     for line in error_log:
         f.write(str(line) + "\n")
 

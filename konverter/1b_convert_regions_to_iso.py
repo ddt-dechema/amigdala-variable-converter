@@ -1,7 +1,7 @@
 import pandas as pd
 import country_converter as coco
 from pathlib import Path
-
+from config import DICTIONARY_FILE_PATH
 # 1. Custom-Mapping
 custom_regions = {
     "ACE": "Asia (Eastern)",
@@ -90,6 +90,7 @@ def convert_regions_to_fullname(file_path, sheet_name='regions'):
 
 if __name__ == "__main__":
     print("=== Regionen-Umbenennung zu ausgeschriebenen Ländernamen ===\n")
-    file_path = "dictionary_dataexplorer_variables_translation.xlsm"  # oder deine gewünschte Datei
+    # file_path = "dictionary_dataexplorer_variables_translation.xlsm"  # oder deine gewünschte Datei
+    file_path = DICTIONARY_FILE_PATH  # aus config.py importieren
     convert_regions_to_fullname(file_path)
 
