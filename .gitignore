@@ -5,7 +5,8 @@ venv/*
 *workspace
 
 # In- & Output folders
-input/POC*
+input/*POC*
+input/OneDrive*
 output/error*
 
 # Testing scripts
