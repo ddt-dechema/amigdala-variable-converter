@@ -27,7 +27,15 @@ amigdala-variable-converter/
 
 ## Setup
 
-1. **Create a virtual environment**
+1. **clone repository, install python, create virtual environment**
+
+   ```bash
+   git clone https://github.com/ddt-dechema/amigdala-variable-converter.git
+   ```
+
+   useful links:
+   https://code.visualstudio.com/docs/python/python-tutorial
+   
 
    ```bash
    python -m venv venv
@@ -45,13 +53,15 @@ amigdala-variable-converter/
    pip install pandas openpyxl
    pip install ...
    ```
+   Do not forget to fetch:
+   * model results file from TNO sharepoint
+   * The central dictionary or mapping file (`dictionary_dataexplorer_variables_translation.xlsm`).
+   This contains the mapping of original variables to pyam variables, as well as harmonized names for regions, scenarios etc. for all models.
+   * please note that within this script, the file is renamed to "...-local.xlsm" to distinguish it from the one on the sharepoint.
+   *-* The latest version of this file can be found on the TNO sharepoint
 
 ## Usage
 
-0. **Maintain the mapping file**
-   - The central dictionary or mapping file (`dictionary_dataexplorer_variables_translation.xlsm`) contains the mapping of original variables to pyam variables, as well as harmonized names for regions, scenarios etc. for all models.
-   - This latest version of this file can be found on the TNO sharepoint
-   
 1. **Edit the config.yaml**
    - Update the information in the config.yaml file:
       - Where are the model results stored?
@@ -68,7 +78,7 @@ amigdala-variable-converter/
    - This script looks in every sub-folder defined in the `config`-file for `.xslx` and `.csv`-files
    - if you would only like to include the files from a specific PoC run, indicate the corresponding folder
    - Each model runs should be saved in a subfolder.
-   - The output of this python scripts lists the following information in the resulting file `overview_input_files_unsorted.xlsx`.<br>
+   - The output of this python scripts lists the following information in the resulting file `overview_files_unsorted.xlsx`.<br>
    They are almost already in the format necessary for the variables mapping-Excel file and contain these information:
       - model name
       - folder name
@@ -78,7 +88,12 @@ amigdala-variable-converter/
       
       For the following processing, the files must contain information about: `variable names`, `region`, `year`, `unit`, `value`<br>
          Please note, that some model output files contain multiple sheets, although not all of them are relevant.
-   - These information should then be put into the `overview_files_variables.xlsx` file.
+
+   >**UPDATE**
+   >- This script now looks for most of the required information automatically, such as `scenario`, `region`, `year`, `value` and `unit`.
+   >- Common names are stored within the code directly (lines 20-24)
+
+   - These information should then be put into the `overview_files.xlsx` file.
    - Please note that in case of the variable names, it might be possible that they are distributed over multiple columns, each with different names.
    In that case the column names containing the variables must be concatenated with "|", e.g.:<br> 
    `Variable|Sector|Subsector|Carrier`.  
@@ -88,15 +103,16 @@ amigdala-variable-converter/
      ```bash
      python konverter/2_mapping_utils.py
      ```
-   - The script reads the input file(s), uses the dictionary (mapping file), and generates a pyam-compatible Excel file in the `output/` folder for each excel/csv-file which is being loaded.
-   - The first time this script runs, it will find that all the variables have not been assigned to a new name, as well as regions, scenario or model names, which have not been listed in the dictionary. <br>
+   - The script reads the input file(s), uses the dictionary (mapping file), and generates a pyam-compatible Excel file in the `output/` folder for each listed excel/csv-file.
+   - The first time this script runs, it might find some `variables` which are not listed in the dictionary yet, possibly also `regions`, `scenario` or `model names`.<br>
    These are listed in the terminal and the `error_log.txt` in the `output/` folder.
    - These information should be discussed bilaterally with the model owners and then updated in the dictionary file.
    - Re-run the conversion with the updated dictionary file until there are no more errors. 
-   - All converte files are stored in the `/output`-folder named `pyam_MODELNAME_original-filename.xlsx`.
-   > NOTE : To upload the data to the data explorer, the data must be put in one single file per model, or per scenario. This is not done yet. 
+   - All converted files are stored in the `/output`-folder named `pyam_MODELNAME_original-filename.xlsx`.
+   > NOTE : If there are multiple files for a model, they are aggregated into a single file, because this is required for uploading to the data explorer. 
 
-4. **Run the script to harmonize update region naming**
+## Others
+1. **Run the script to harmonize update region naming**
    - If necessary and some regions are named differently, e.g. with 2 or 3 letter codes or with other abbreviatons.<br>
    Use the following script to harmonize them:
       ```bash
@@ -106,10 +122,6 @@ amigdala-variable-converter/
    Custom region names are stored directly in a python `dict`.
    - This script will convert the regions in the  `dictionary_dataexplorer_variables_translation.xlsm` file the sheet `regions` and create a new file `dictionary_dataexplorer_variables_translation-local_regions_fullname.xlsx` file.
    - The information can then be used to update the region list in the dictionary file.
-
-
-5. **Check the result**
-   - The output files should be checked and could be uploaded directly to the data explorer or used for further analysis.
 
 ## Notes
 
@@ -122,8 +134,7 @@ amigdala-variable-converter/
 
 ## Next Steps
 
-- Integrate additional model files (which were not shared on the TNO Sharepoint) by adding them to the mapping file and creating new scripts if needed.
-- Check the variable lists and update the amigdala-workflow repo and inform IIASA
+- Check the variable lists and update the amigdala-workflow repo and inform IIASA via Pull request
 - upload the data to the [data explorer](https://amigdala-internal.apps.ece.iiasa.ac.at/)
 
 
@@ -140,3 +151,8 @@ Each row represents a unique combination of model, scenario, region, variable, a
 | model | scenario | region | variable | unit | 2020 | 2025 | 2030 | ... |
 |-------|----------|--------|----------|------|------|------|------|-----|
 | PRISM | 1. W2.4-EU net0 | AUT | Recycling | t | 247411.99 | 54031.48 | 55913.79 | ... |
+
+---
+
+This script was written by DDT (DECHEMA) for the AMIGDALA project.
+The AMIGDALA project is funded by the European Union under the grant agreement 101138534. 
