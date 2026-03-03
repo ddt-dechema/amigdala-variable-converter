@@ -6,11 +6,13 @@ venv/*
 
 # In- & Output folders
 input/POC*
-output/POC*
+output/error*
 
 # Testing scripts
 test/*
-*.xlsx
+*.xls*
 
 konverter/prism*
 konverter/times*
+
+*pycache*
