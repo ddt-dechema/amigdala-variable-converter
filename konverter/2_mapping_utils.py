@@ -28,28 +28,29 @@ COLUMN_ALIASES = {
 # HELPER FUNCTIONS
 # ============================================================
 
-def check_dictionary_entries(df, column, dictionary, label, error_log):
-    """
-    Prüft, ob Werte aus df[column] im dictionary vorkommen.
-    Meldet fehlende Werte (Case- & Whitespace-insensitiv),
-    listet sie zeilenweise im Log (copy-paste-freundlich) und färbt farbig ein.
-    """
-    if column not in df.columns:
-        return
+# def check_dictionary_entries(df, column, dictionary, label, error_log):
+#     """
+#     Prüft, ob Werte aus df[column] im dictionary vorkommen.
+#     Meldet fehlende Werte (Case- & Whitespace-insensitiv),
+#     listet sie zeilenweise im Log (copy-paste-freundlich) und färbt farbig ein.
+#     """
+#     if column not in df.columns:
+#         return
 
-    # Werte bereinigen (String, Trim, Case)
-    values = df[column].dropna().astype(str).str.strip()
-    dict_keys = {k.strip().lower() for k in dictionary.keys() if isinstance(k, str)}
-    missing = sorted({v for v in values if v.lower() not in dict_keys and v})
+#     # Werte bereinigen (String, Trim, Case)
+#     values = df[column].dropna().astype(str).str.strip()
+#     dict_keys = {k.strip().lower() for k in dictionary.keys() if isinstance(k, str)}
+#     missing = sorted({v for v in values if v.lower() not in dict_keys and v})
 
-    if missing:
-        msg_header = f"[Dictionary] {len(missing)} {label} not found in Dictionary:"
-        print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
-        error_log.append(msg_header)
-        for val in missing:
-            line = f"  - {val}"
-            print(line)
-            error_log.append(line)
+#     if missing:
+#         msg_header = f"[Dictionary] {len(missing)} {label} not found in Dictionary:"
+#         print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
+#         error_log.append(msg_header)
+#         for val in missing:
+#             # line = f"  - {val}"
+#             line = f"{val}"
+#             print(line)
+#             error_log.append(line)
 
 def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True):
     """
@@ -85,27 +86,67 @@ def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True):
     mapped = df[column].map(mapping_dict)
 
     # find missing
-    missing_items = df.loc[mapped.isna(), column].unique().tolist()
-    if missing_items:
-        msg_header = f"[Dictionary] {len(missing_items)} {label} entries not found in dictionary:"
+    # missing_items = df.loc[mapped.isna(), column].unique().tolist()
+    # also print unit of not found variables
+    missing_rows = df.loc[mapped.isna(), [column] + ([ 'unit' ] if 'unit' in df.columns else [])].copy()
+
+    # if missing_items:
+    #     msg_header = f"[Dictionary] {len(missing_items)} {label} entries not found in dictionary:"
+    #     print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
+    #     error_log.append(msg_header)
+    #     for val in sorted(missing_items):
+    #         # line = f"  - {val}"
+    #         line = f"{val}"
+    #         print(line)
+    #         error_log.append(line)
+
+    extra_cols = []
+    # Only add unit to missing variables, not to unit itself
+    if 'unit' in df.columns and column != 'unit':
+        extra_cols.append('unit')
+
+    missing_rows = df.loc[mapped.isna(), [column] + extra_cols].copy()
+    missing_rows = missing_rows.drop_duplicates()
+    
+    if not missing_rows.empty:
+        msg_header = f"[Dictionary] {len(missing_rows)} {label} entries not found in dictionary:"
         print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
         error_log.append(msg_header)
-        for val in sorted(missing_items):
-            line = f"  - {val}"
+
+        for _, row in missing_rows.drop_duplicates(subset=[column]).iterrows():
+            val = row[column]
+            if 'unit' in row and column != 'unit' and pd.notna(row['unit']):
+                line = f"{val} - {row['unit']}"
+            else:
+                line = str(val)
             print(line)
             error_log.append(line)
 
+        
     if drop_unmapped:
         df = df.loc[mapped.notna()].copy()
         mapped = mapped.dropna()
 
     return mapped
 
-def load_mapping_dict(file, sheet, src_col, tgt_col):
-    df = pd.read_excel(file, sheet_name=sheet, usecols=[src_col, tgt_col])
-    if not {src_col, tgt_col}.issubset(df.columns):
-        raise KeyError(f"Missing columns in '{sheet}'. Expected {src_col} and {tgt_col}.")
-    return pd.Series(df[tgt_col].values, index=df[src_col]).to_dict()
+def load_mapping_dict(file, sheet, src_col, tgt_col, conv_col=None):
+    # df = pd.read_excel(file, sheet_name=sheet, usecols=[src_col, tgt_col])
+    df = pd.read_excel(file, sheet_name=sheet)
+    if conv_col and conv_col not in df.columns:
+        raise KeyError(f"Missing {conv_col} column in '{sheet}'.")
+    if conv_col:
+        # Liefert dict: {source_unit: {'target': ..., 'factor': ...}}
+        mapping = {}
+        for _, row in df.iterrows():
+            src = row[src_col]
+            tgt = row[tgt_col]
+            factor = row[conv_col]
+            if pd.notna(src) and pd.notna(tgt):
+                mapping[src] = {'target': tgt, 'factor': factor if pd.notna(factor) else 1}
+        return mapping
+    else:
+        # alter fallback
+        return pd.Series(df[tgt_col].values, index=df[src_col]).to_dict()
             
 # ============================================================
 # 1. Dictionary-Dateien laden
@@ -117,7 +158,9 @@ dict_variable = load_mapping_dict(DICTIONARY_FILE_PATH, 'variables', 'names mapp
 dict_region   = load_mapping_dict(DICTIONARY_FILE_PATH, 'regions', 'source_region', 'target_region')
 dict_model    = load_mapping_dict(DICTIONARY_FILE_PATH, 'models', 'source_models', 'target_models')
 dict_scenario = load_mapping_dict(DICTIONARY_FILE_PATH, 'scenarios', 'source_scenario', 'target_scenario')
-dict_unit = load_mapping_dict(DICTIONARY_FILE_PATH, 'units', 'source_unit', 'target_unit')
+dict_unit     = load_mapping_dict(DICTIONARY_FILE_PATH, 'units', 'source_unit', 'target_unit', 'conversion_factor')
+dict_unit_target = {k: v['target'] for k, v in dict_unit.items()}
+dict_unit_factor = {k: v['factor'] for k, v in dict_unit.items()}
 
 
 print(f"{len(dict_variable)} variables loaded from dictionary.")
@@ -207,6 +250,8 @@ for model, model_group in model_groups:
             elif file_name.lower().endswith('.csv'):
                 sep = config['Separator'] if config['Separator'] else ','
                 df_input = pd.read_csv(INPUT_FILE_PATH, sep=sep, low_memory=False, engine="c", dtype_backend="numpy_nullable")
+                df_input.dropna(how='all', inplace=True)
+
             else:
                 msg = f"WARNING: Unknown Format – skipped: {file_name}"
                 print(msg)
@@ -264,7 +309,17 @@ for model, model_group in model_groups:
         df_input['variable'] = map_strict(df_input, 'original_variable', dict_variable, 'Variables', error_log)
         df_input['region']   = map_strict(df_input, 'region', dict_region, 'Regions', error_log)
         df_input['scenario'] = map_strict(df_input, 'scenario', dict_scenario, 'Scenarios', error_log)
-        df_input['unit']     = map_strict(df_input, 'unit', dict_unit, 'Units', error_log)
+        
+        # --- Convert units into desired target unit/dimension
+        # get conversion factor from dictionary (default to 1 if not found)
+        df_input['conversion_factor'] = df_input['unit'].map(dict_unit_factor).fillna(1)
+
+        # recalculate values based on conversion factor (if unit was found in dict, otherwise keep original value)
+        df_input['value'] = df_input['value'] * df_input['conversion_factor']
+
+        # rename unit to target unit (if found in dict, otherwise keep original unit)
+        df_input['unit'] = map_strict(df_input, 'unit', dict_unit_target, 'Units', error_log)
+
 
         df_input.dropna(subset=['variable', 'region', 'scenario'], inplace=True)
         if df_input.empty:
