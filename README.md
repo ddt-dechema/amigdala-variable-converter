@@ -13,12 +13,14 @@ amigdala-variable-converter/
 │   ├── 1_lookup_files.py                # Conversion logic for the PRISM model (example)
 │   └── 1b_convert_regions_to_iso.py            # Other model converters
 │   └── 2_mapping_utils.py            # Other model converters
+│   └── 3_convert_to_yaml            # convert variable name, description and unit from CSV to yaml format
 ├── input/                      # Input files (CSV/Excel, structured by model)
 │   └── ...                            # currently containing files from Amigdala Poc1 and Poc2 runs
+│   └── Variableninfo            #contains infos as CSV that should be converted to yaml file
 │
 ├── output/                     # Output files in pyam format
 │   └── error_log.txt            # file, which will always be created after running the mapping-utils
-│   └── ...                      # all the converted pyam files
+│   └── ...                      # all the converted pyam & yaml files 
 │
 ├── dictionary_dataexplorer_variables_translation.xlsm       # Central mapping file/dictionary for variable names, regions, scenarios, models etc. Can be found on TNO sharepoint
 ├── overview_files_variables.txt            # List of files and variables which are to be converted
@@ -122,6 +124,16 @@ amigdala-variable-converter/
    Custom region names are stored directly in a python `dict`.
    - This script will convert the regions in the  `dictionary_dataexplorer_variables_translation.xlsm` file the sheet `regions` and create a new file `dictionary_dataexplorer_variables_translation-local_regions_fullname.xlsx` file.
    - The information can then be used to update the region list in the dictionary file.
+
+2. **convert new variables in yaml**
+   - If necessary run conversion of infos on new variables, including name, description and unit, from CSV to yaml format, which is ready to implement in IIASA workflow
+   - save in the CSV `yaml_update`, which is in the input folder in `variable_info` the infos variable names, descriptions and units which should be converted to the yaml file with  IAMC naming conventions. Use the file `yaml_update_template` as a template. 
+   - Run the conversion script with:
+     ```bash
+     python konverter/3_import_csv.py
+     ```
+   - The script reads the input folder from folder `variable_info` the CSV `yaml_update` and it is converted to yaml file for the upload in the IIASA workflow.
+   - the created yaml is saved as `outfile`
 
 ## Notes
 
