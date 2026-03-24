@@ -13,3 +13,6 @@ MAPPING_FILE_PATH = r'..\\overview_files.xlsx'
 # MAPPING_FILE_PATH = 'overview_files_variables.xlsx'
 DICTIONARY_FILE_PATH = r'..\\dictionary_dataexplorer_variables_translation-local.xlsm'
 OUTPUT_FOLDER = r'..\\output'  # Ordner für Ausgabedateien
+
+#relevant für 3_import_csv:
+datei_pfad_csv = r'..\\input\\variable_info\\yaml_update.csv'
