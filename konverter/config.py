@@ -6,7 +6,8 @@
 # MODEL_RESULTS_FOLDER = r'input\\POC_2.0'  # Pfad zu den Modelldateien
 
 # relevant für 1_lookup_files
-MODEL_RESULTS_FOLDER = r'..\\input\\Plastic POC 2.0_2025.10'  # Pfad zu den Modelldateien
+# MODEL_RESULTS_FOLDER = r'..\\input\\2026 Test run March-April'  # Pfad zu den Modelldateien
+MODEL_RESULTS_FOLDER = r'..\\input'  # Pfad zu den Modelldateien
 
 # relevant für 2_mapping_utils
 MAPPING_FILE_PATH = r'..\\overview_files.xlsx'
@@ -16,3 +17,4 @@ OUTPUT_FOLDER = r'..\\output'  # Ordner für Ausgabedateien
 
 #relevant für 3_import_csv:
 datei_pfad_csv = r'..\\input\\variable_info\\yaml_update.csv'
+datei_pfad_xlsx = r'..\\input\\variable_info\\yaml_update_paper.xlsx'

@@ -18,9 +18,9 @@ from config import *
 
 COLUMN_ALIASES = {
     "scenario": ["scenario", "Scenario", "Scenario name", "Source Scenario", "scen", "SCEN1"],
-    "region":   ["region", "Region", "Region name", "Source Region", "area", "AREA"],
+    "region":   ["region", "Region", "Region name", "Source Region", "area", "AREA", "Aggregate region"],
     "year":     ["year", "Year", "TIME", "Source Year", "Period"],
-    "value":    ["value", "Value", "Source Value", "VAL", "growth"],
+    "value":    ["value", "Value", "Source Value", "VAL", "growth", "Net production", "Annual cost"],
     "unit":     ["Unit", "unit"],
 }
 
@@ -264,6 +264,34 @@ for model, model_group in model_groups:
             error_log.append(msg)
             continue
 
+        # NEW - also process files which are already in the IAMC format
+        # ----------------------------------------------------
+        # Optional: Handle files that are already in pyam/IAMC format
+        # ----------------------------------------------------
+        pyam_like = all(
+            any(str(year).isdigit() for year in df_input.columns)
+            for _ in [0]
+        ) and "variable" in df_input.columns and "region" in df_input.columns
+
+        if pyam_like:
+            print(Fore.CYAN + "Detected pyam/IAMC-wide format. Melting to long form..." + Style.RESET_ALL)
+
+            # Melt Jahr-Spalten zu 'year'/'value'
+            year_cols = [c for c in df_input.columns if str(c).isdigit()]
+            df_input = df_input.melt(
+                id_vars=[c for c in df_input.columns if c not in year_cols],
+                value_vars=year_cols,
+                var_name="year",
+                value_name="value"
+            )
+
+            # Jahr-Spalte zu numerisch konvertieren
+            df_input["year"] = pd.to_numeric(df_input["year"], errors="coerce")
+
+            # Nur gültige Zeilen behalten
+            df_input.dropna(subset=["year", "value"], inplace=True)
+
+
         # ----------------------------------------------------
         # 5.1.2  Standardize column names using aliases
         # ----------------------------------------------------
@@ -304,10 +332,40 @@ for model, model_group in model_groups:
             continue
 
         # ----------------------------------------------------
+        # Detect and handle IAMC/pyam wide-format files
+        # ----------------------------------------------------
+        year_cols = [c for c in df_input.columns if str(c).isdigit()]
+
+        if year_cols:
+            print(Fore.CYAN + f"Detected IAMC/pyam wide format with {len(year_cols)} year columns – converting to long format..." + Style.RESET_ALL)
+
+            id_vars = [c for c in df_input.columns if c not in year_cols]
+            df_input = df_input.melt(
+                id_vars=id_vars,
+                value_vars=year_cols,
+                var_name="year",
+                value_name="value"
+            )
+
+            # convert year -> numeric
+            df_input["year"] = pd.to_numeric(df_input["year"], errors="coerce")
+
+            # drop empty rows
+            df_input.dropna(subset=["value"], inplace=True)
+            df_input.reset_index(drop=True, inplace=True)
+
+
+        # ----------------------------------------------------
         # Dictionary mapping
         # ----------------------------------------------------
+        # build allow-target mapping
+        _targets = set(dict_region.values())
+        dict_region_allow_target = dict(dict_region)
+        dict_region_allow_target.update({t: t for t in _targets if pd.notna(t)})
+        
         df_input['variable'] = map_strict(df_input, 'original_variable', dict_variable, 'Variables', error_log)
-        df_input['region']   = map_strict(df_input, 'region', dict_region, 'Regions', error_log)
+        # df_input['region']   = map_strict(df_input, 'region', dict_region, 'Regions', error_log)
+        df_input['region'] = map_strict(df_input, 'region', dict_region_allow_target, 'Regions', error_log)
         df_input['scenario'] = map_strict(df_input, 'scenario', dict_scenario, 'Scenarios', error_log)
         
         # --- Convert units into desired target unit/dimension
@@ -315,6 +373,24 @@ for model, model_group in model_groups:
         df_input['conversion_factor'] = df_input['unit'].map(dict_unit_factor).fillna(1)
 
         # recalculate values based on conversion factor (if unit was found in dict, otherwise keep original value)
+        # --- Ensure numeric values before applying conversion factor
+        df_input['value'] = pd.to_numeric(
+            df_input['value']
+                .astype('string')
+                .str.replace(' ', '', regex=False)     # remove thousands spaces
+                .str.replace('\u00A0', '', regex=False) # remove NBSP if present
+                .str.replace(',', '.', regex=False),   # decimal comma -> dot
+            errors='coerce'
+        )
+
+        # Optional: log rows where value couldn't be parsed
+        bad_value_rows = df_input.loc[df_input['value'].isna(), ['original_variable'] + (['unit'] if 'unit' in df_input.columns else [])].head(20)
+        if not bad_value_rows.empty:
+            msg = "[Check] WARNING: Some 'value' entries are non-numeric and were set to NaN (showing up to 20 rows)."
+            print(Fore.YELLOW + msg + Style.RESET_ALL)
+            error_log.append(msg)
+            for _, r in bad_value_rows.iterrows():
+                error_log.append(str(r.to_dict()))
         df_input['value'] = df_input['value'] * df_input['conversion_factor']
 
         # rename unit to target unit (if found in dict, otherwise keep original unit)
