@@ -17,4 +17,4 @@ OUTPUT_FOLDER = r'..\\output'  # Ordner für Ausgabedateien
 
 #relevant für 3_import_csv:
 datei_pfad_csv = r'..\\input\\variable_info\\yaml_update.csv'
-datei_pfad_xlsx = r'..\\input\\variable_info\\yaml_update_paper.xlsx'
+datei_pfad_xlsx = r'..\\input\\variable_info\\yaml_update_cement.xlsx'

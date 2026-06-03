@@ -4,6 +4,9 @@ import os, sys, time, gc
 import numpy as np
 # from collections import defaultdict, Counter
 from pathlib import Path
+
+import errno
+
 from colorama import Fore, Style, init
 init(autoreset=True)
 
@@ -17,7 +20,7 @@ start_time = time.time()
 from config import * 
 
 COLUMN_ALIASES = {
-    "scenario": ["scenario", "Scenario", "Scenario name", "Source Scenario", "scen", "SCEN1"],
+    "scenario": ["scenario", "Scenario", "Scenario name", "Source Scenario", "scen", "SCEN2"],
     "region":   ["region", "Region", "Region name", "Source Region", "area", "AREA", "Aggregate region"],
     "year":     ["year", "Year", "TIME", "Source Year", "Period"],
     "value":    ["value", "Value", "Source Value", "VAL", "growth", "Net production", "Annual cost"],
@@ -27,30 +30,6 @@ COLUMN_ALIASES = {
 # ============================================================
 # HELPER FUNCTIONS
 # ============================================================
-
-# def check_dictionary_entries(df, column, dictionary, label, error_log):
-#     """
-#     Prüft, ob Werte aus df[column] im dictionary vorkommen.
-#     Meldet fehlende Werte (Case- & Whitespace-insensitiv),
-#     listet sie zeilenweise im Log (copy-paste-freundlich) und färbt farbig ein.
-#     """
-#     if column not in df.columns:
-#         return
-
-#     # Werte bereinigen (String, Trim, Case)
-#     values = df[column].dropna().astype(str).str.strip()
-#     dict_keys = {k.strip().lower() for k in dictionary.keys() if isinstance(k, str)}
-#     missing = sorted({v for v in values if v.lower() not in dict_keys and v})
-
-#     if missing:
-#         msg_header = f"[Dictionary] {len(missing)} {label} not found in Dictionary:"
-#         print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
-#         error_log.append(msg_header)
-#         for val in missing:
-#             # line = f"  - {val}"
-#             line = f"{val}"
-#             print(line)
-#             error_log.append(line)
 
 def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True):
     """
@@ -147,6 +126,11 @@ def load_mapping_dict(file, sheet, src_col, tgt_col, conv_col=None):
     else:
         # alter fallback
         return pd.Series(df[tgt_col].values, index=df[src_col]).to_dict()
+
+        
+def _next_copy_path(path: str, i: int) -> str:
+    p = Path(path)
+    return str(p.with_name(f"{p.stem}_copy{i}{p.suffix}"))
             
 # ============================================================
 # 1. Dictionary-Dateien laden
@@ -414,7 +398,9 @@ for model, model_group in model_groups:
             'unit':     df_input['unit'],
             'year':     df_input['year'],
             'value':    df_input['value'],
-            'variable': df_input['variable']
+            'variable': df_input['variable'],
+            'file_location': file_location, # new, to faciliate debugging in case of duplicates
+            'file_name': file_name  # new
         }
         df_iamc = pd.DataFrame(data_for_iamc)
 
@@ -462,7 +448,6 @@ for model, model_group in model_groups:
                 # assign incremental IDs for visible duplicates
                 for i, idx in enumerate(group.index, start=1):
                     rows_to_rename.append((idx, f"dup_{group.iloc[i-1]['region']}_{i}"))
-
         # delete exact duplicates
         if rows_to_drop:
             df_model_combined.drop(index=list(rows_to_drop), inplace=True)
@@ -487,19 +472,76 @@ for model, model_group in model_groups:
     # 5.4. Pivotieren & Speichern (safe even with renamed duplicates)
     # --------------------------------------------------------
     try:
-        df_output = (
-            df_model_combined
-            .pivot(index=['model', 'scenario', 'region', 'variable', 'unit'],
-                columns='year', values='value')
-            .reset_index()
-        )
+        final_out_file = None
+        
+        if dupe_mask.any():
+            df_output = (
+                df_model_combined
+                .pivot(index=['model', 'scenario', 'region', 'variable', 'unit'
+                            , 'file_location', 'file_name'], # new. to facilitate the detection of duplicates
+                    columns='year', values='value')
+                .reset_index()
+            )
+        else:
+            df_output = (
+                df_model_combined
+                .pivot(index=['model', 'scenario', 'region', 'variable', 'unit'],
+                    columns='year', values='value')
+                .reset_index()
+            )
+
         df_output.columns = [str(col) for col in df_output.columns]
+        
+        # --- Build duplicates sheet (only if duplicates exist) ---
+        df_dups_output = None
+        if dupe_mask.any():
+            df_dups = df_model_combined.loc[dupe_mask].copy()
+
+            # same pivot structure as the main output when duplicates exist
+            df_dups_output = (
+                df_dups
+                .pivot(
+                    index=['model', 'scenario', 'region', 'variable', 'unit',
+                        'file_location', 'file_name'],
+                    columns='year',
+                    values='value'
+                )
+                .reset_index()
+            )
+            df_dups_output.columns = [str(col) for col in df_dups_output.columns]
+
 
         out_file = os.path.join(OUTPUT_FOLDER, f"pyam_{model}.xlsx")
-        os.makedirs(os.path.dirname(out_file), exist_ok=True)
-        df_output.to_excel(out_file, index=False, sheet_name='pyam_data')
+        # os.makedirs(os.path.dirname(out_file), exist_ok=True)
+        # df_output.to_excel(out_file, index=False, sheet_name='pyam_data')
+        
+        for i in range(0, 26):
+            candidate = out_file if i == 0 else _next_copy_path(out_file, i)
+            try:
+                os.makedirs(os.path.dirname(out_file), exist_ok=True)
+                # df_output.to_excel(candidate, index=False, sheet_name='pyam_data')
+                
+                with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
+                    df_output.to_excel(writer, index=False, sheet_name="pyam_data")
 
-        print(Fore.GREEN + f"✅ Saved combined (with dup markers) file for model: {model}" + Style.RESET_ALL)
+                    # write duplicates sheet only if it exists
+                    if df_dups_output is not None and not df_dups_output.empty:
+                        df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
+
+                final_out_file = candidate
+                if i > 0:
+                    msg = f"\n[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
+                    print(Fore.YELLOW + msg + Style.RESET_ALL)
+                    error_log.append(msg)
+                break
+            except PermissionError:
+                continue
+
+        if final_out_file is None:
+            raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
+
+        output_msg_dups = "(with duplicates marked)" if dupe_mask.any() else ""
+        print(Fore.GREEN + f"✅ Saved combined {output_msg_dups} file for model: {model} as {final_out_file}" + Style.RESET_ALL)
 
     except Exception as e:
         msg = f"ERROR during pivot/save for model {model}: {e}"
