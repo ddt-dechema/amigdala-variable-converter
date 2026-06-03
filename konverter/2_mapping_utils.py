@@ -17,7 +17,7 @@ start_time = time.time()
 from config import * 
 
 COLUMN_ALIASES = {
-    "scenario": ["scenario", "Scenario", "Scenario name", "Source Scenario", "scen", "SCEN1"],
+    "scenario": ["scenario", "Scenario", "Scenario name", "Source Scenario", "scen", "SCEN2"],
     "region":   ["region", "Region", "Region name", "Source Region", "area", "AREA", "Aggregate region"],
     "year":     ["year", "Year", "TIME", "Source Year", "Period"],
     "value":    ["value", "Value", "Source Value", "VAL", "growth", "Net production", "Annual cost"],
