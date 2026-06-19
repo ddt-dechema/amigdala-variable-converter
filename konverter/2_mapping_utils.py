@@ -4,9 +4,15 @@ import os, sys, time, gc
 import numpy as np
 # from collections import defaultdict, Counter
 from pathlib import Path
-
+import re
+import warnings
+warnings.filterwarnings(
+    "ignore",
+    message="Data Validation extension is not supported and will be removed",
+    category=UserWarning,
+    module="openpyxl"
+)
 import errno
-
 from colorama import Fore, Style, init
 init(autoreset=True)
 
@@ -31,7 +37,7 @@ COLUMN_ALIASES = {
 # HELPER FUNCTIONS
 # ============================================================
 
-def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True):
+def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True, include_unit_in_missing=False):
     """
     Maps a DataFrame column via a provided dictionary and logs missing mappings.
     Optionally drops unmapped rows for strict filtering.
@@ -67,7 +73,8 @@ def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True):
     # find missing
     # missing_items = df.loc[mapped.isna(), column].unique().tolist()
     # also print unit of not found variables
-    missing_rows = df.loc[mapped.isna(), [column] + ([ 'unit' ] if 'unit' in df.columns else [])].copy()
+    # missing_rows = df.loc[mapped.isna(), [column] + ([ 'unit' ] if 'unit' in df.columns else [])].copy()
+    # missing_rows = df_input.loc[missing_mask, ['region']].copy()
 
     # if missing_items:
     #     msg_header = f"[Dictionary] {len(missing_items)} {label} entries not found in dictionary:"
@@ -80,9 +87,11 @@ def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True):
     #         error_log.append(line)
 
     extra_cols = []
-    # Only add unit to missing variables, not to unit itself
-    if 'unit' in df.columns and column != 'unit':
+    if include_unit_in_missing and 'unit' in df.columns and column != 'unit':
         extra_cols.append('unit')
+    # Only add unit to missing variables, not to unit itself
+    # if 'unit' in df.columns and column != 'unit':
+    #     extra_cols.append('unit')
 
     missing_rows = df.loc[mapped.isna(), [column] + extra_cols].copy()
     missing_rows = missing_rows.drop_duplicates()
@@ -127,6 +136,284 @@ def load_mapping_dict(file, sheet, src_col, tgt_col, conv_col=None):
         # alter fallback
         return pd.Series(df[tgt_col].values, index=df[src_col]).to_dict()
 
+def load_unit_pair_to_factor(file, sheet="units",
+                             src_col="source_unit", tgt_col="target_unit", factor_col="conversion_factor"):
+    df = pd.read_excel(file, sheet_name=sheet)
+
+    for c in [src_col, tgt_col, factor_col]:
+        if c not in df.columns:
+            raise KeyError(f"Missing column '{c}' in sheet '{sheet}'")
+
+    df = df[[src_col, tgt_col, factor_col]].copy()
+
+    # normalize
+    df[src_col] = df[src_col].map(lambda v: _norm_cell(v, empty_as_none=False))
+    df[tgt_col] = df[tgt_col].map(lambda v: _norm_cell(v, empty_as_none=False))
+
+    df[factor_col] = pd.to_numeric(df[factor_col], errors="coerce").fillna(1)
+
+    # drop empty
+    df = df[(df[src_col] != "") & (df[tgt_col] != "")].copy()
+
+    # if duplicates exist, ensure they don't conflict
+    dup = df.duplicated(subset=[src_col, tgt_col], keep=False)
+    if dup.any():
+        conflict = df[dup].groupby([src_col, tgt_col])[factor_col].nunique()
+        bad = conflict[conflict > 1]
+        if not bad.empty:
+            raise ValueError(f"Conflicting conversion_factor for some (source_unit,target_unit) pairs in sheet '{sheet}'")
+
+    # keep one row per pair
+    return df.drop_duplicates(subset=[src_col, tgt_col]).set_index([src_col, tgt_col])[factor_col].to_dict()
+
+def load_variable_target_units(file, sheet="variables", var_col="DE variable name", unit_col="unit"):
+    """
+    Return dict: {canonical_variable -> target_unit} from the variables sheet.
+    canonical_variable must match df_input['variable'] AFTER your variable mapping.
+    """
+    df = pd.read_excel(file, sheet_name=sheet)
+
+    for c in [var_col, unit_col]:
+        if c not in df.columns:
+            raise KeyError(f"Missing column '{c}' in sheet '{sheet}'")
+
+    df = df[[var_col, unit_col]].copy()
+    df[var_col] = df[var_col].astype("string").str.strip()
+    df[unit_col] = df[unit_col].astype("string").str.strip()
+
+    df = df[df[var_col].notna() & (df[var_col] != "") & df[unit_col].notna() & (df[unit_col] != "")]
+    return df.set_index(var_col)[unit_col].to_dict()
+
+
+# def build_unit_pair_maps(dict_unit):
+#     """
+#     Build lookup dict from dict_unit (loaded via load_mapping_dict with conversion_factor).
+#     Returns:
+#       pair_to_factor: {(src_unit, tgt_unit) -> factor}
+#       src_to_tgt_set: {src_unit -> set(tgt_unit)} (optional, useful for debugging)
+#     """
+#     pair_to_factor = {}
+#     src_to_tgt_set = {}
+
+#     for src, v in dict_unit.items():
+#         # dict_unit entries look like: src -> {'target': ..., 'factor': ...}
+#         if not isinstance(v, dict):
+#             continue
+
+#         tgt = v.get("target")
+#         factor = v.get("factor", 1)
+
+#         if pd.isna(src) or pd.isna(tgt):
+#             continue
+
+#         src_s = _norm_cell(src, empty_as_none=False)
+#         tgt_s = _norm_cell(tgt, empty_as_none=False)
+
+#         if not src_s or not tgt_s:
+#             continue
+
+#         pair_to_factor[(src_s, tgt_s)] = factor
+#         src_to_tgt_set.setdefault(src_s, set()).add(tgt_s)
+
+#     return pair_to_factor, src_to_tgt_set
+
+def load_mapping_with_conflicts(file, sheet, src_col, tgt_col, *, extra_cols=None):
+    """
+    Loads mapping src->tgt but does NOT fail on duplicates.
+    Instead returns:
+      - mapping_unique: dict for src values that map uniquely to exactly one tgt
+      - conflicts: dict[src] -> DataFrame(rows) for src values that map to multiple targets
+      - raw_df: the normalized dataframe used (optional debugging)
+    """
+    df = pd.read_excel(file, sheet_name=sheet)
+
+    for c in [src_col, tgt_col]:
+        if c not in df.columns:
+            raise KeyError(f"Missing column '{c}' in sheet '{sheet}'")
+
+    cols = [src_col, tgt_col] + (extra_cols or [])
+    df = df[cols].copy()
+
+    df[src_col] = df[src_col].astype("string").str.strip()
+    df[tgt_col] = df[tgt_col].astype("string").str.strip()
+
+    # keep rows where src exists (target may be blank in your sheet; we keep it for reporting)
+    df = df[df[src_col].notna() & (df[src_col] != "")].copy()
+
+    # compute number of distinct targets per src (treat blanks as a value for conflict detection)
+    # If you want blanks ignored in uniqueness, tell me; for now we treat blank as a target.
+    n_targets = df.groupby(src_col)[tgt_col].nunique(dropna=False)
+
+    conflicts_src = n_targets[n_targets > 1].index.tolist()
+
+    conflicts = {}
+    if conflicts_src:
+        dups = df[df[src_col].isin(conflicts_src)].copy()
+        for src in conflicts_src:
+            conflicts[src] = dups[dups[src_col] == src].copy()
+
+    # build unique mapping for src with exactly one target AND non-blank target
+    unique_src = n_targets[n_targets == 1].index
+    df_unique = df[df[src_col].isin(unique_src)].copy()
+
+    # if there are blank targets among "unique", you probably don't want them as mapping entries
+    df_unique_nonblank = df_unique[df_unique[tgt_col].notna() & (df_unique[tgt_col] != "")].copy()
+
+    mapping_unique = pd.Series(df_unique_nonblank[tgt_col].values, index=df_unique_nonblank[src_col]).to_dict()
+
+    return mapping_unique, conflicts, df
+def load_region_mapping_model_aware(file, sheet="regions",
+                                   src_col="source_region", tgt_col="target_region",
+                                   folder_col="folder", model_sep="|"):
+    """
+    Builds two mappings from the regions sheet:
+      - countries_map: {source_region -> target_region} for folder == 'countries' (must be unique)
+      - regions_map_by_model: {(model, source_region) -> target_region} for folder == 'regions'
+    Also returns:
+      - conflicts: dict with human-readable conflict buckets for logging
+
+    Assumptions (per your confirmation):
+      - For folder=='regions', target_region is always 'MODEL_NAME|REGION_NAME'
+      - Output should keep the MODEL_NAME| prefix
+    """
+    df = pd.read_excel(file, sheet_name=sheet)
+
+    for c in [src_col, tgt_col, folder_col]:
+        if c not in df.columns:
+            raise KeyError(f"Missing column '{c}' in sheet '{sheet}'")
+
+    df = df[[src_col, tgt_col, folder_col]].copy()
+    df[src_col] = df[src_col].astype("string").str.strip()
+    df[tgt_col] = df[tgt_col].astype("string").str.strip()
+    df[folder_col] = df[folder_col].astype("string").str.strip().str.lower()
+
+    # keep rows where source exists
+    df = df[df[src_col].notna() & (df[src_col] != "")].copy()
+
+    # split
+    df_countries = df[df[folder_col].eq("countries")].copy()
+    df_regions   = df[df[folder_col].eq("regions")].copy()
+
+    conflicts = {
+        "countries_ambiguous": {},   # src -> rows
+        "regions_bad_format": {},    # src -> rows where target not like MODEL|...
+        "regions_ambiguous": {},     # (model, src) -> rows if conflicting
+    }
+
+    # -----------------------
+    # Countries: must be unique src -> tgt (ignoring blank targets still problematic)
+    # -----------------------
+    if not df_countries.empty:
+        # consider blank target as value too (to catch 'GBR' -> blank + UK)
+        n_targets = df_countries.groupby(src_col)[tgt_col].nunique(dropna=False)
+        bad_src = n_targets[n_targets > 1].index.tolist()
+        for src in bad_src:
+            conflicts["countries_ambiguous"][src] = df_countries[df_countries[src_col] == src].copy()
+
+        # build countries_map only for unique + non-blank targets
+        ok_src = n_targets[n_targets == 1].index
+        df_ok = df_countries[df_countries[src_col].isin(ok_src)].copy()
+        df_ok = df_ok[df_ok[tgt_col].notna() & (df_ok[tgt_col] != "")]
+        countries_map = pd.Series(df_ok[tgt_col].values, index=df_ok[src_col]).to_dict()
+    else:
+        countries_map = {}
+
+    # -----------------------
+    # Regions: require target format MODEL|Region
+    # -----------------------
+    if not df_regions.empty:
+        has_sep = df_regions[tgt_col].fillna("").str.contains(r"\|", regex=True)
+        df_bad = df_regions[~has_sep].copy()
+        if not df_bad.empty:
+            # group by src for logging
+            for src, g in df_bad.groupby(src_col):
+                conflicts["regions_bad_format"][src] = g.copy()
+
+        df_good = df_regions[has_sep].copy()
+        # parse model = part before first '|'
+        df_good["__model"] = df_good[tgt_col].str.split(model_sep, n=1, expand=True)[0].astype("string").str.strip()
+
+        # detect conflicting duplicates for same (model, src)
+        key_cols = ["__model", src_col]
+        # Here: conflicting if same key has multiple distinct target_region strings
+        n_targets2 = df_good.groupby(key_cols)[tgt_col].nunique(dropna=False)
+        bad_keys = n_targets2[n_targets2 > 1].index.tolist()
+        for mdl, src in bad_keys:
+            conflicts["regions_ambiguous"][(mdl, src)] = df_good[(df_good["__model"] == mdl) & (df_good[src_col] == src)].copy()
+
+        # build mapping for keys with exactly 1 target
+        ok_keys = n_targets2[n_targets2 == 1].index
+        df_ok2 = df_good.set_index(key_cols)
+        df_ok2 = df_ok2.loc[df_ok2.index.isin(ok_keys)].copy()
+        regions_map_by_model = df_ok2[tgt_col].to_dict()
+    else:
+        regions_map_by_model = {}
+
+    return countries_map, regions_map_by_model, conflicts, df
+
+def _norm_cell(x, *, empty_as_none=True):
+    """
+    Normalize any cell-like value:
+    - convert to string
+    - replace NBSP with normal spaces
+    - collapse repeated whitespace
+    - strip
+    """
+    if pd.isna(x):
+        return None if empty_as_none else ""
+
+    s = str(x)
+    s = s.replace("\u00A0", " ")       # NBSP -> normal space
+    s = re.sub(r"\s+", " ", s)         # collapse whitespace runs
+    s = s.strip()
+
+    if s == "":
+        return None if empty_as_none else ""
+    return s
+
+def norm_unit(x):
+    return _norm_cell(x, empty_as_none=False)
+
+def load_context_mapping(file, sheet, key_cols, value_cols):
+    """
+    Generic loader for context-aware mappings.
+    Returns: dict[tuple] -> dict(value_cols...)
+    Fails if the same key tuple appears with different values.
+    """
+    df = pd.read_excel(file, sheet_name=sheet)
+    for c in key_cols + value_cols:
+        if c not in df.columns:
+            raise KeyError(f"Missing column '{c}' in sheet '{sheet}'")
+
+    df = df[key_cols + value_cols].copy()
+    for c in key_cols + value_cols:
+        df[c] = df[c].apply(_norm_cell)
+
+    # drop empty keys (if any key col is None, we still keep it as wildcard context)
+    # but require that the "source" part is present: assume last key col is the "source" identifier
+    src_key_col = key_cols[-1]
+    df = df[df[src_key_col].notna()]
+
+    mapping = {}
+    collisions = []
+    for _, row in df.iterrows():
+        key = tuple(row[c] for c in key_cols)
+        val = tuple(row[c] for c in value_cols)
+
+        if key in mapping and mapping[key] != val:
+            collisions.append((key, mapping[key], val))
+        else:
+            mapping[key] = val
+
+    if collisions:
+        lines = [f"[Dictionary] Conflicting rows in sheet '{sheet}' for the same key:"]
+        for key, v_old, v_new in collisions[:50]:
+            lines.append(f"- key={key}: {v_old} vs {v_new}")
+        raise ValueError("\n".join(lines))
+
+    # return as dict of dict for readability
+    return {k: {value_cols[i]: v[i] for i in range(len(value_cols))} for k, v in mapping.items()}
+
         
 def _next_copy_path(path: str, i: int) -> str:
     p = Path(path)
@@ -139,25 +426,61 @@ def _next_copy_path(path: str, i: int) -> str:
 print(f"Loading dictionary from: {DICTIONARY_FILE_PATH}")
 
 dict_variable = load_mapping_dict(DICTIONARY_FILE_PATH, 'variables', 'names mapping', 'DE variable name')
-dict_region   = load_mapping_dict(DICTIONARY_FILE_PATH, 'regions', 'source_region', 'target_region')
+# NEW: variable -> target unit (from variables-sheet)
+var_to_target_unit = load_variable_target_units(
+    DICTIONARY_FILE_PATH,
+    sheet="variables",
+    var_col="DE variable name",
+    unit_col="unit"
+)
+
+# dict_region   = load_mapping_dict(DICTIONARY_FILE_PATH, 'regions', 'source_region', 'target_region')
 dict_model    = load_mapping_dict(DICTIONARY_FILE_PATH, 'models', 'source_models', 'target_models')
 dict_scenario = load_mapping_dict(DICTIONARY_FILE_PATH, 'scenarios', 'source_scenario', 'target_scenario')
-dict_unit     = load_mapping_dict(DICTIONARY_FILE_PATH, 'units', 'source_unit', 'target_unit', 'conversion_factor')
-dict_unit_target = {k: v['target'] for k, v in dict_unit.items()}
-dict_unit_factor = {k: v['factor'] for k, v in dict_unit.items()}
+# dict_unit     = load_mapping_dict(DICTIONARY_FILE_PATH, 'units', 'source_unit', 'target_unit', 'conversion_factor')
+# dict_unit_target = {k: v['target'] for k, v in dict_unit.items()}
+# dict_unit_factor = {k: v['factor'] for k, v in dict_unit.items()}
+# NEW: (source_unit, target_unit) -> conversion_factor
+unit_pair_to_factor = load_unit_pair_to_factor(DICTIONARY_FILE_PATH, sheet="units")
+print(f"{len(unit_pair_to_factor)} unit conversion pairs loaded from units-sheet.")
+
+print(f"{len(var_to_target_unit)} variable target units loaded from variables-sheet.")
+
+
+# new - stricter loading of regions to catch duplicates and mapping issues early (since regions are often the main source of headaches in such mappings)
+countries_map, regions_map_by_model, region_conflicts, df_region_dict = load_region_mapping_model_aware(
+    DICTIONARY_FILE_PATH,
+    sheet="regions",
+    src_col="source_region",
+    tgt_col="target_region",
+    folder_col="folder",
+    model_sep="|"
+)
 
 
 print(f"{len(dict_variable)} variables loaded from dictionary.")
-print(f"{len(dict_region)} regions loaded from dictionary.")
+print(f"{len(countries_map)} country region mappings loaded (unique).")
+print(f"{len(regions_map_by_model)} model-specific region mappings loaded (unique).")
 print(f"{len(dict_model)} models loaded from dictionary.")
 print(f"{len(dict_scenario)} scenarios loaded from dictionary.\n")
-print(f"{len(dict_unit)} units loaded from dictionary.\n")
+# print(f"{len(dict_unit)} units loaded from dictionary.\n")
 
 # ============================================================
 # 2. Initialisierung & Hilfsklassen
 # ============================================================
 
 error_log = []
+fatal_issues = []  # list of strings (global)
+
+def log_error(msg, *, fatal=False):
+    """Log to terminal and error_log; optionally also to fatal_issues."""
+    # print: fatal in red, sonst gelb/cyan je nach Geschmack
+    if fatal:
+        print(Fore.RED + Style.BRIGHT + msg + Style.RESET_ALL)
+        fatal_issues.append(msg)
+    else:
+        print(Fore.YELLOW + msg + Style.RESET_ALL)
+    error_log.append(msg)
 
 # ============================================================
 # 3. Mapping-Datei laden
@@ -201,9 +524,12 @@ print(f"\n⏱️ Runtime so far: {elapsed:.2f} Seconds\n")
 model_groups = df_mapping_full.groupby('Source model')
 print(f"\n{len(model_groups)} unique models for processing found.")
 
-for model, model_group in model_groups:
-    print(Fore.CYAN + Style.BRIGHT + f"\n=== Processing model: {model} ===" + Style.RESET_ALL)
-    error_log.append(f"\n=== {model} ===")
+for model_raw, model_group in model_groups:
+    model_key = dict_model.get(model_raw, model_raw)
+
+    print(Fore.CYAN + Style.BRIGHT + f"\n=== Processing model: {model_key} (source: {model_raw}) ===" + Style.RESET_ALL)
+    error_log.append(f"\n=== {model_key} (source: {model_raw}) ===")
+
 
     df_model_all = []  # collect IAMC data for each file of this model
 
@@ -342,19 +668,82 @@ for model, model_group in model_groups:
         # ----------------------------------------------------
         # Dictionary mapping
         # ----------------------------------------------------
-        # build allow-target mapping
-        _targets = set(dict_region.values())
-        dict_region_allow_target = dict(dict_region)
-        dict_region_allow_target.update({t: t for t in _targets if pd.notna(t)})
+        # --- Report ambiguous region keys only if they appear in this input file
+        # --- Region mapping (model-aware for folder=regions, global for countries)
+        if 'region' in df_input.columns:
+            src_region_series = df_input['region'].astype('string').str.strip()
+
+            # 1) pass-through if already in target form for THIS model (MODEL|...)
+            # Since you want model prefix in output, we allow already-prefixed values.
+            already_prefixed = src_region_series.fillna("").str.startswith(f"{model_key}|")
+
+            # 2) map model-specific regions: (model, source_region)
+            # build keys for vectorized-ish mapping
+            keys = list(zip([model_key] * len(src_region_series), src_region_series.tolist()))
+            mapped_model = pd.Series(keys, index=df_input.index).map(regions_map_by_model)
+
+            # 3) map countries (model-independent)
+            mapped_country = src_region_series.map(countries_map)
+
+            # combine with precedence:
+            # already_prefixed -> keep as is
+            # else model-specific mapping
+            # else country mapping
+            # else NaN (will be handled by map_strict-like logic below)
+            final_region = src_region_series.where(already_prefixed, mapped_model)
+            final_region = final_region.fillna(mapped_country)
+
+            # log missing / drop unmapped like map_strict does
+            missing_mask = final_region.isna()
+            if missing_mask.any():
+                missing_vals = (
+                    src_region_series.loc[missing_mask]
+                    .astype("string")
+                    .str.strip()
+                )
+
+                # remove empties
+                missing_vals = missing_vals[missing_vals.notna() & (missing_vals != "")]
+
+                counts = missing_vals.value_counts(dropna=False)
+
+                msg_header = f"[Dictionary] {len(counts)} Regions entries not found in dictionary:"
+                print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
+                error_log.append(msg_header)
+
+                # print each missing region once (with count if >1)
+                for region_name, n in counts.items():
+                    line = f"{region_name}" if n > 1 else str(region_name)
+                    print(line)
+                    error_log.append(line)
+
+                # drop unmapped rows
+                df_input = df_input.loc[~missing_mask].copy()
+                final_region = final_region.loc[~missing_mask].copy()
+
+
+            df_input['region'] = final_region
+        else:
+            msg = "[Dictionary] Column 'region' not found in input; cannot map Regions."
+            print(Fore.YELLOW + msg + Style.RESET_ALL)
+            error_log.append(msg)
+            df_input['region'] = pd.Series(dtype='string')
+
+        # old
+        # _targets = set(dict_region.values())
+        # dict_region_allow_target = dict(dict_region)
+        # dict_region_allow_target.update({t: t for t in _targets if pd.notna(t)})
         
-        df_input['variable'] = map_strict(df_input, 'original_variable', dict_variable, 'Variables', error_log)
+        # build allow-target mapping
+        
+        df_input['variable'] = map_strict(df_input, 'original_variable', dict_variable, 'Variables', error_log, include_unit_in_missing=True)
         # df_input['region']   = map_strict(df_input, 'region', dict_region, 'Regions', error_log)
-        df_input['region'] = map_strict(df_input, 'region', dict_region_allow_target, 'Regions', error_log)
-        df_input['scenario'] = map_strict(df_input, 'scenario', dict_scenario, 'Scenarios', error_log)
+        # df_input['region'] = map_strict(df_input, 'region', dict_region_allow_target, 'Regions', error_log)
+        df_input['scenario'] = map_strict(df_input, 'scenario', dict_scenario, 'Scenarios', error_log, include_unit_in_missing=False)
         
         # --- Convert units into desired target unit/dimension
         # get conversion factor from dictionary (default to 1 if not found)
-        df_input['conversion_factor'] = df_input['unit'].map(dict_unit_factor).fillna(1)
+        # df_input['conversion_factor'] = df_input['unit'].map(dict_unit_factor).fillna(1)
 
         # recalculate values based on conversion factor (if unit was found in dict, otherwise keep original value)
         # --- Ensure numeric values before applying conversion factor
@@ -375,10 +764,87 @@ for model, model_group in model_groups:
             error_log.append(msg)
             for _, r in bad_value_rows.iterrows():
                 error_log.append(str(r.to_dict()))
-        df_input['value'] = df_input['value'] * df_input['conversion_factor']
+        # df_input['value'] = df_input['value'] * df_input['conversion_factor']
 
         # rename unit to target unit (if found in dict, otherwise keep original unit)
-        df_input['unit'] = map_strict(df_input, 'unit', dict_unit_target, 'Units', error_log)
+        # --- Units (NEW): variable-driven target unit + conversion via (source_unit, target_unit) rules
+
+        # target unit per row (from variables-sheet; df_input['variable'] must be canonical)
+        df_input['desired_unit'] = df_input['variable'].map(var_to_target_unit)
+
+        # warn if target unit missing for some variables
+        missing_desired = df_input['desired_unit'].isna() | (df_input['desired_unit'].astype('string').str.strip() == '')
+        if missing_desired.any():
+            miss_vars = df_input.loc[missing_desired, ['variable']].drop_duplicates().head(50)
+            msg = f"[Dictionary] WARNING: {int(missing_desired.sum())} rows have variables without target unit (showing up to 50 unique variables)."
+            print(Fore.YELLOW + msg + Style.RESET_ALL)
+            error_log.append(msg)
+            for v in miss_vars['variable'].tolist():
+                error_log.append(str(v))
+
+        cur_unit = df_input['unit'].map(norm_unit)
+        des_unit = df_input['desired_unit'].map(norm_unit)
+
+        has_des = des_unit.notna() & (des_unit != '')
+
+        # pass-through when already correct
+        same_unit = has_des & (cur_unit == des_unit)
+
+        df_input['conversion_factor'] = 1.0
+
+        need_conv = has_des & cur_unit.notna() & (cur_unit != '') & (cur_unit != des_unit)
+        keys = list(zip(cur_unit[need_conv].tolist(), des_unit[need_conv].tolist()))
+        factors = pd.Series(keys, index=df_input.index[need_conv]).map(unit_pair_to_factor)
+        df_input.loc[need_conv, 'conversion_factor'] = factors
+
+        # missing conversion rules -> log + drop (strict)
+        miss_factor = need_conv & df_input['conversion_factor'].isna()
+        if miss_factor.any():
+            # DEBUG: show repr() of one failing pair
+            first_idx = df_input.index[miss_factor][0]
+            dbg_src = df_input.at[first_idx, 'unit']  # oder cur_unit.loc[first_idx]
+            dbg_tgt = df_input.at[first_idx, 'desired_unit']  # oder des_unit.loc[first_idx]
+            print("[DEBUG] source_unit repr:", repr(str(dbg_src)))
+            print("[DEBUG] target_unit repr:", repr(str(dbg_tgt)))
+            pairs = pd.DataFrame({
+                'source_unit': cur_unit[miss_factor].tolist(),
+                'target_unit': des_unit[miss_factor].tolist(),
+            })
+            counts = pairs.value_counts().reset_index(name='n')
+
+            msg_header = f"[Dictionary] {len(counts)} Unit conversion pairs not found in units-sheet (showing up to 50):"
+            print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
+            error_log.append(msg_header)
+
+            for _, r in counts.head(50).iterrows():
+                line = f"{r['source_unit']} -> {r['target_unit']} (x{int(r['n'])})"
+                print(line)
+                error_log.append(line)
+
+            df_input = df_input.loc[~miss_factor].copy()
+
+            # refresh after dropping
+            cur_unit = df_input['unit'].astype('string').str.strip()
+            des_unit = df_input['desired_unit'].astype('string').str.strip()
+            has_des = des_unit.notna() & (des_unit != '')
+
+        # set final unit to desired_unit where available
+        df_input.loc[has_des, 'unit'] = df_input.loc[has_des, 'desired_unit']
+
+        # numeric value + apply factor (your existing parse logic)
+        df_input['value'] = pd.to_numeric(
+            df_input['value']
+                .astype('string')
+                .str.replace(' ', '', regex=False)
+                .str.replace('\u00A0', '', regex=False)
+                .str.replace(',', '.', regex=False),
+            errors='coerce'
+        )
+
+        df_input['value'] = df_input['value'] * df_input['conversion_factor'].fillna(1)
+
+        # optional cleanup
+        df_input.drop(columns=['desired_unit'], inplace=True, errors='ignore')
 
 
         df_input.dropna(subset=['variable', 'region', 'scenario'], inplace=True)
@@ -404,9 +870,9 @@ for model, model_group in model_groups:
         }
         df_iamc = pd.DataFrame(data_for_iamc)
 
-        df_iamc['model'] = dict_model.get(model, model)
-        if model not in dict_model:
-            msg = f"WARNING: Source model '{model}' not found in dictionary."
+        df_iamc['model'] = model_key
+        if model_raw not in dict_model:
+            msg = f"WARNING: Source model '{model_raw}' not found in dictionary."
             print(msg)
             error_log.append(msg)
 
@@ -417,7 +883,7 @@ for model, model_group in model_groups:
     # Combine and save one result per model
     # --------------------------------------------------------
     if not df_model_all:
-        print(Fore.YELLOW + f"No valid files for model {model}, skipping." + Style.RESET_ALL)
+        print(Fore.YELLOW + f"No valid files for model {model_key}, skipping." + Style.RESET_ALL)
         continue
 
     df_model_combined = pd.concat(df_model_all, ignore_index=True, copy=False)
@@ -430,7 +896,7 @@ for model, model_group in model_groups:
 
     if dupe_mask.any():
         dup_count = dupe_mask.sum()
-        msg = f"[Check] Found {dup_count} duplicate rows for model {model}. Identical-valued duplicates will be removed; differing ones will be suffixed."
+        msg = f"[Check] Found {dup_count} duplicate rows for model {model_key}. Identical-valued duplicates will be removed; differing ones will be suffixed."
         print(Fore.YELLOW + msg + Style.RESET_ALL)
         error_log.append(msg)
 
@@ -451,7 +917,7 @@ for model, model_group in model_groups:
         # delete exact duplicates
         if rows_to_drop:
             df_model_combined.drop(index=list(rows_to_drop), inplace=True)
-            msg = f"Removed {len(rows_to_drop)} rows with identical duplicates for model {model}."
+            msg = f"Removed {len(rows_to_drop)} rows with identical duplicates for model {model_key}."
             print(Fore.GREEN + msg + Style.RESET_ALL)
             error_log.append(msg)
 
@@ -460,11 +926,11 @@ for model, model_group in model_groups:
             for idx, new_name in rows_to_rename:
                 df_model_combined.at[idx, 'region'] = new_name
 
-            msg = f"Renamed {len(rows_to_rename)} remaining duplicate rows with 'dup_' prefix for model {model}."
+            msg = f"Renamed {len(rows_to_rename)} remaining duplicate rows with 'dup_' prefix for model {model_key}."
             print(Fore.GREEN + msg + Style.RESET_ALL)
             error_log.append(msg)
     else:
-        msg = f"[Check] No duplicates found for model {model}."
+        msg = f"[Check] No duplicates found for model {model_key}."
         print(msg)
         error_log.append(msg)
 
@@ -511,7 +977,7 @@ for model, model_group in model_groups:
             df_dups_output.columns = [str(col) for col in df_dups_output.columns]
 
 
-        out_file = os.path.join(OUTPUT_FOLDER, f"pyam_{model}.xlsx")
+        out_file = os.path.join(OUTPUT_FOLDER, f"pyam_{model_key}.xlsx")
         # os.makedirs(os.path.dirname(out_file), exist_ok=True)
         # df_output.to_excel(out_file, index=False, sheet_name='pyam_data')
         
@@ -522,7 +988,7 @@ for model, model_group in model_groups:
                 # df_output.to_excel(candidate, index=False, sheet_name='pyam_data')
                 
                 with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
-                    df_output.to_excel(writer, index=False, sheet_name="pyam_data")
+                    df_output.to_excel(writer, index=False, sheet_name="data") # renamed from 'pyam_data' to 'data' to pass upload
 
                     # write duplicates sheet only if it exists
                     if df_dups_output is not None and not df_dups_output.empty:
@@ -541,10 +1007,10 @@ for model, model_group in model_groups:
             raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
 
         output_msg_dups = "(with duplicates marked)" if dupe_mask.any() else ""
-        print(Fore.GREEN + f"✅ Saved combined {output_msg_dups} file for model: {model} as {final_out_file}" + Style.RESET_ALL)
+        print(Fore.GREEN + f"✅ Saved combined {output_msg_dups} file for model: {model_key} as {final_out_file}" + Style.RESET_ALL)
 
     except Exception as e:
-        msg = f"ERROR during pivot/save for model {model}: {e}"
+        msg = f"ERROR during pivot/save for model {model_key}: {e}"
         print(Fore.RED + msg + Style.RESET_ALL)
         error_log.append(msg)
         continue
@@ -559,6 +1025,10 @@ for model, model_group in model_groups:
 # ============================================================
 # 6. Abschluss & Logs
 # ============================================================
+if fatal_issues:
+    print(Fore.RED + Style.BRIGHT + "\n❌ Fatal dictionary issues detected. See error_log.txt for details." + Style.RESET_ALL)
+    # optional: stop with non-zero exit (so CI / batch knows it's broken)
+    raise SystemExit(2)
 
 print(Fore.GREEN + Style.BRIGHT + "\n✅ All files processed." + Style.RESET_ALL)
 
