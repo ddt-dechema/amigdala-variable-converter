@@ -26,11 +26,11 @@ start_time = time.time()
 from config import * 
 
 COLUMN_ALIASES = {
-    "scenario": ["scenario", "Scenario", "Scenario name", "Source Scenario", "scen", "SCEN2"],
-    "region":   ["region", "Region", "Region name", "Source Region", "area", "AREA", "Aggregate region"],
-    "year":     ["year", "Year", "TIME", "Source Year", "Period"],
-    "value":    ["value", "Value", "Source Value", "VAL", "growth", "Net production", "Annual cost"],
-    "unit":     ["Unit", "unit"],
+    "scenario": ["scenario", "Scenario", "Scenario name", "scenarioname", "Source Scenario", "scen", "SCEN1", "SCENARIO"],
+    "region":   ["region", "Region", "Region name", "Source Region", "area", "AREA", "REGION", "Aggregate region"],
+    "year":     ["year", "Year", "TIME", "Source Year", "Period", "YEAR"],
+    "value":    ["value", "Value", "Source Value", "VAL", "growth", "VALUE", "IMPACT_VALUE"],
+    "unit":     ["Unit", "unit", "UNIT", "IMPACT_UNIT"],
 }
 
 # ============================================================
@@ -418,6 +418,21 @@ def load_context_mapping(file, sheet, key_cols, value_cols):
 def _next_copy_path(path: str, i: int) -> str:
     p = Path(path)
     return str(p.with_name(f"{p.stem}_copy{i}{p.suffix}"))
+
+
+error_log = []
+fatal_issues = []  # list of strings (global)
+
+def log_error(msg, *, fatal=False):
+    """Log to terminal and error_log; optionally also to fatal_issues."""
+    # print: fatal in red, sonst gelb/cyan je nach Geschmack
+    if fatal:
+        print(Fore.RED + Style.BRIGHT + msg + Style.RESET_ALL)
+        fatal_issues.append(msg)
+    else:
+        print(Fore.YELLOW + msg + Style.RESET_ALL)
+    error_log.append(msg)
+
             
 # ============================================================
 # 1. Dictionary-Dateien laden
@@ -457,7 +472,22 @@ countries_map, regions_map_by_model, region_conflicts, df_region_dict = load_reg
     model_sep="|"
 )
 
+# --- NEW: report region dictionary conflicts early (and fail if you want)
+if region_conflicts.get("countries_ambiguous"):
+    log_error(f"[Dictionary] Countries region codes are ambiguous: {len(region_conflicts['countries_ambiguous'])}", fatal=False)
+    for src, g in list(region_conflicts["countries_ambiguous"].items())[:50]:
+        targets = sorted(set(g["target_region"].fillna("").astype(str).tolist()))
+        log_error(f"  - {src}: {targets}", fatal=False)
 
+if region_conflicts.get("regions_bad_format"):
+    log_error(f"[Dictionary] Regions entries without MODEL| prefix: {len(region_conflicts['regions_bad_format'])}", fatal=False)
+    for src, g in list(region_conflicts["regions_bad_format"].items())[:50]:
+        targets = sorted(set(g["target_region"].fillna("").astype(str).tolist()))
+        log_error(f"  - {src}: {targets}", fatal=False)
+
+if region_conflicts.get("regions_ambiguous"):
+    log_error(f"[Dictionary] Model-specific region mappings ambiguous: {len(region_conflicts['regions_ambiguous'])}", fatal=False)
+    
 print(f"{len(dict_variable)} variables loaded from dictionary.")
 print(f"{len(countries_map)} country region mappings loaded (unique).")
 print(f"{len(regions_map_by_model)} model-specific region mappings loaded (unique).")
@@ -468,19 +498,6 @@ print(f"{len(dict_scenario)} scenarios loaded from dictionary.\n")
 # ============================================================
 # 2. Initialisierung & Hilfsklassen
 # ============================================================
-
-error_log = []
-fatal_issues = []  # list of strings (global)
-
-def log_error(msg, *, fatal=False):
-    """Log to terminal and error_log; optionally also to fatal_issues."""
-    # print: fatal in red, sonst gelb/cyan je nach Geschmack
-    if fatal:
-        print(Fore.RED + Style.BRIGHT + msg + Style.RESET_ALL)
-        fatal_issues.append(msg)
-    else:
-        print(Fore.YELLOW + msg + Style.RESET_ALL)
-    error_log.append(msg)
 
 # ============================================================
 # 3. Mapping-Datei laden
@@ -673,24 +690,56 @@ for model_raw, model_group in model_groups:
         if 'region' in df_input.columns:
             src_region_series = df_input['region'].astype('string').str.strip()
 
+            # Helper: normalize for case-insensitive matching, while keeping canonical spelling from dictionary
+            def _norm_key(v) -> str:
+                base = _norm_cell(v, empty_as_none=False)
+                return (base or "").casefold()
+
+            # Build canonical lookups for "already target" values
+            # This enables e.g. 'UNITED KINGDOM' -> 'United Kingdom' if the target exists that way.
+            country_target_canon = {}
+            for tgt in countries_map.values():
+                if pd.isna(tgt):
+                    continue
+                k = _norm_key(tgt)
+                if k and k not in country_target_canon:
+                    country_target_canon[k] = tgt
+
+            region_target_canon = {}
+            for tgt in regions_map_by_model.values():
+                if pd.isna(tgt):
+                    continue
+                k = _norm_key(tgt)
+                if k and k not in region_target_canon:
+                    region_target_canon[k] = tgt
+
             # 1) pass-through if already in target form for THIS model (MODEL|...)
             # Since you want model prefix in output, we allow already-prefixed values.
             already_prefixed = src_region_series.fillna("").str.startswith(f"{model_key}|")
 
-            # 2) map model-specific regions: (model, source_region)
+            # 2) allow-target fallback: if input already equals a target_region (case-insensitive), keep canonical spelling
+            norm_src = src_region_series.map(_norm_key)
+            mapped_country_target = norm_src.map(country_target_canon)
+            mapped_region_target_any = norm_src.map(region_target_canon)
+
+            # 3) map model-specific regions: (model, source_region)
             # build keys for vectorized-ish mapping
             keys = list(zip([model_key] * len(src_region_series), src_region_series.tolist()))
             mapped_model = pd.Series(keys, index=df_input.index).map(regions_map_by_model)
 
-            # 3) map countries (model-independent)
+            # 4) map countries (model-independent)
             mapped_country = src_region_series.map(countries_map)
 
             # combine with precedence:
             # already_prefixed -> keep as is
+            # else if matches a known target -> keep canonical target spelling
             # else model-specific mapping
             # else country mapping
-            # else NaN (will be handled by map_strict-like logic below)
-            final_region = src_region_series.where(already_prefixed, mapped_model)
+            # else NaN (handled below)
+            final_region = src_region_series.where(already_prefixed, pd.NA)
+            final_region = final_region.fillna(mapped_country_target)
+            final_region = final_region.fillna(mapped_region_target_any)
+            final_region = final_region.fillna(mapped_model)
             final_region = final_region.fillna(mapped_country)
 
             # log missing / drop unmapped like map_strict does
@@ -705,6 +754,23 @@ for model_raw, model_group in model_groups:
                 # remove empties
                 missing_vals = missing_vals[missing_vals.notna() & (missing_vals != "")]
 
+                amb_countries = set(region_conflicts.get("countries_ambiguous", {}).keys())
+                bad_regions   = set(region_conflicts.get("regions_bad_format", {}).keys())
+
+                missing_raw = src_region_series.loc[missing_mask].astype("string").str.strip()
+                missing_raw = missing_raw[missing_raw.notna() & (missing_raw != "")]
+
+                is_amb = missing_raw.isin(list(amb_countries))
+                is_bad = missing_raw.isin(list(bad_regions))
+
+                if is_amb.any():
+                    vals = sorted(missing_raw[is_amb].unique().tolist())
+                    log_error(f"[Dictionary] Ambiguous country codes encountered (fix dictionary): {vals}", fatal=False)
+
+                if is_bad.any():
+                    vals = sorted(missing_raw[is_bad].unique().tolist())
+                    log_error(f"[Dictionary] Region codes have bad format in dictionary (expected MODEL|...): {vals}", fatal=False)
+                                        
                 counts = missing_vals.value_counts(dropna=False)
 
                 msg_header = f"[Dictionary] {len(counts)} Regions entries not found in dictionary:"
@@ -771,16 +837,21 @@ for model_raw, model_group in model_groups:
 
         # target unit per row (from variables-sheet; df_input['variable'] must be canonical)
         df_input['desired_unit'] = df_input['variable'].map(var_to_target_unit)
-
+        
         # warn if target unit missing for some variables
         missing_desired = df_input['desired_unit'].isna() | (df_input['desired_unit'].astype('string').str.strip() == '')
+        has_var = df_input['variable'].notna() & (df_input['variable'].astype('string').str.strip() != '')
+
+        missing_desired = missing_desired & has_var
         if missing_desired.any():
+            print("[DEBUG] variable NaN count:", int(df_input['variable'].isna().sum()))
+            print("[DEBUG] desired_unit NaN count:", int(df_input['desired_unit'].isna().sum()))
             miss_vars = df_input.loc[missing_desired, ['variable']].drop_duplicates().head(50)
-            msg = f"[Dictionary] WARNING: {int(missing_desired.sum())} rows have variables without target unit (showing up to 50 unique variables)."
-            print(Fore.YELLOW + msg + Style.RESET_ALL)
-            error_log.append(msg)
+            log_error(f"[Dictionary] WARNING: {int(missing_desired.sum())} rows have variables without target unit (showing up to 50 unique variables).", fatal=False)
+
             for v in miss_vars['variable'].tolist():
-                error_log.append(str(v))
+                log_error(f"  - {v}", fatal=False)
+
 
         cur_unit = df_input['unit'].map(norm_unit)
         des_unit = df_input['desired_unit'].map(norm_unit)
@@ -799,33 +870,58 @@ for model_raw, model_group in model_groups:
 
         # missing conversion rules -> log + drop (strict)
         miss_factor = need_conv & df_input['conversion_factor'].isna()
+
         if miss_factor.any():
-            # DEBUG: show repr() of one failing pair
-            first_idx = df_input.index[miss_factor][0]
-            dbg_src = df_input.at[first_idx, 'unit']  # oder cur_unit.loc[first_idx]
-            dbg_tgt = df_input.at[first_idx, 'desired_unit']  # oder des_unit.loc[first_idx]
-            print("[DEBUG] source_unit repr:", repr(str(dbg_src)))
-            print("[DEBUG] target_unit repr:", repr(str(dbg_tgt)))
+            # Which unit-pairs are missing?
             pairs = pd.DataFrame({
                 'source_unit': cur_unit[miss_factor].tolist(),
                 'target_unit': des_unit[miss_factor].tolist(),
+                'variable': df_input.loc[miss_factor, 'variable'].astype('string').str.strip().tolist(),
+                'original_variable': df_input.loc[miss_factor, 'original_variable'].astype('string').str.strip().tolist() if 'original_variable' in df_input.columns else [''] * int(miss_factor.sum()),
+                'region': df_input.loc[miss_factor, 'region'].astype('string').str.strip().tolist() if 'region' in df_input.columns else [''] * int(miss_factor.sum()),
+                'scenario': df_input.loc[miss_factor, 'scenario'].astype('string').str.strip().tolist() if 'scenario' in df_input.columns else [''] * int(miss_factor.sum()),
             })
-            counts = pairs.value_counts().reset_index(name='n')
 
-            msg_header = f"[Dictionary] {len(counts)} Unit conversion pairs not found in units-sheet (showing up to 50):"
+            # Summarize missing pairs
+            pair_counts = pairs.groupby(['source_unit', 'target_unit']).size().reset_index(name='n').sort_values('n', ascending=False)
+
+            msg_header = f"[Dictionary] {len(pair_counts)} Unit conversion pairs not found in units-sheet (showing up to 50):"
             print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
             error_log.append(msg_header)
 
-            for _, r in counts.head(50).iterrows():
+            for _, r in pair_counts.head(50).iterrows():
                 line = f"{r['source_unit']} -> {r['target_unit']} (x{int(r['n'])})"
                 print(line)
                 error_log.append(line)
 
+                # For each missing pair: show which mapped variables are responsible (top 15)
+                sub = pairs[(pairs['source_unit'] == r['source_unit']) & (pairs['target_unit'] == r['target_unit'])].copy()
+                var_counts = sub['variable'].value_counts().head(15)
+
+                print("  affected variables (top 15):")
+                error_log.append("  affected variables (top 15):")
+                for var_name, vn in var_counts.items():
+                    vline = f"    - {var_name} (x{int(vn)})"
+                    print(vline)
+                    error_log.append(vline)
+
+                # Optional: show a few example original variables to quickly spot bad mappings
+                if 'original_variable' in sub.columns:
+                    ex = sub[['original_variable']].dropna().drop_duplicates().head(5)['original_variable'].tolist()
+                    if ex:
+                        print("  examples original_variable:")
+                        error_log.append("  examples original_variable:")
+                        for e in ex:
+                            eline = f"    - {e}"
+                            print(eline)
+                            error_log.append(eline)
+
+            # IMPORTANT: keep your strict behavior (drop rows with missing conversion rule)
             df_input = df_input.loc[~miss_factor].copy()
 
             # refresh after dropping
-            cur_unit = df_input['unit'].astype('string').str.strip()
-            des_unit = df_input['desired_unit'].astype('string').str.strip()
+            cur_unit = df_input['unit'].map(norm_unit)
+            des_unit = df_input['desired_unit'].map(norm_unit)
             has_des = des_unit.notna() & (des_unit != '')
 
         # set final unit to desired_unit where available
@@ -896,7 +992,7 @@ for model_raw, model_group in model_groups:
 
     if dupe_mask.any():
         dup_count = dupe_mask.sum()
-        msg = f"[Check] Found {dup_count} duplicate rows for model {model_key}. Identical-valued duplicates will be removed; differing ones will be suffixed."
+        msg = f"\n [Check] Found {dup_count} duplicate rows for model {model_key}. Identical-valued duplicates will be removed; differing ones will be suffixed."
         print(Fore.YELLOW + msg + Style.RESET_ALL)
         error_log.append(msg)
 
@@ -934,6 +1030,8 @@ for model_raw, model_group in model_groups:
         print(msg)
         error_log.append(msg)
 
+    # IMPORTANT: dupe_mask is now outdated because we changed 'region'
+    dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
     # --------------------------------------------------------
     # 5.4. Pivotieren & Speichern (safe even with renamed duplicates)
     # --------------------------------------------------------
