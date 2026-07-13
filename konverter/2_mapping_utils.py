@@ -904,8 +904,15 @@ for model_raw, model_group in model_groups:
     # Detect duplicates and mark them clearly
     # --------------------------------------------------------
     dup_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'year']
-    dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
     
+    # set new global variable to None before checking for duplicates
+    dupes_initial = 0
+    
+    dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
+    if dupe_mask.any():
+        dupes_initial = 1
+        print("Yes, there are duplicates")
+
     if dupe_mask.any():
         dup_count = dupe_mask.sum()
         msg = f"\n [Check] Found {dup_count} duplicate rows for model {model_key}. Identical-valued duplicates will be removed; differing ones will be suffixed."
@@ -952,7 +959,9 @@ for model_raw, model_group in model_groups:
     try:
         final_out_file = None
         
-        if dupe_mask.any():
+        has_dup_region = df_model_combined['region'].astype('string').str.startswith('dup_').any()
+
+        if has_dup_region:
             df_output = (
                 df_model_combined
                 .pivot(index=['model', 'scenario', 'region', 'variable', 'unit'
@@ -967,12 +976,12 @@ for model_raw, model_group in model_groups:
                     columns='year', values='value')
                 .reset_index()
             )
-
+                
         df_output.columns = [str(col) for col in df_output.columns]
         
         # --- Build duplicates sheet (only if duplicates exist) ---
         df_dups_output = None
-        if dupe_mask.any():
+        if has_dup_region:
             df_dups = df_model_combined.loc[dupe_mask].copy()
 
             # same pivot structure as the main output when duplicates exist
@@ -1018,7 +1027,7 @@ for model_raw, model_group in model_groups:
         if final_out_file is None:
             raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
 
-        output_msg_dups = "(with duplicates marked)" if dupe_mask.any() else ""
+        output_msg_dups = "(with duplicates marked)" if has_dup_region else ""
         print(Fore.GREEN + f"✅ Saved combined {output_msg_dups} file for model: {model_key} as {final_out_file}" + Style.RESET_ALL)
 
     except Exception as e:
