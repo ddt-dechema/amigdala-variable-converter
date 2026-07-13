@@ -1,8 +1,6 @@
 #%%
 import pandas as pd
 import os, sys, time, gc
-import numpy as np
-# from collections import defaultdict, Counter
 from pathlib import Path
 import re
 import warnings
@@ -32,6 +30,13 @@ COLUMN_ALIASES = {
     "value":    ["value", "Value", "Source Value", "VAL", "growth", "VALUE", "IMPACT_VALUE"],
     "unit":     ["Unit", "unit", "UNIT", "IMPACT_UNIT"],
 }
+
+# ============================================================
+# Hilfsklassen
+# ============================================================
+
+error_log = []
+fatal_issues = []  # list of strings (global)
 
 # ============================================================
 # HELPER FUNCTIONS
@@ -70,22 +75,6 @@ def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True, i
 
     mapped = df[column].map(mapping_dict)
 
-    # find missing
-    # missing_items = df.loc[mapped.isna(), column].unique().tolist()
-    # also print unit of not found variables
-    # missing_rows = df.loc[mapped.isna(), [column] + ([ 'unit' ] if 'unit' in df.columns else [])].copy()
-    # missing_rows = df_input.loc[missing_mask, ['region']].copy()
-
-    # if missing_items:
-    #     msg_header = f"[Dictionary] {len(missing_items)} {label} entries not found in dictionary:"
-    #     print(Fore.YELLOW + Style.BRIGHT + msg_header + Style.RESET_ALL)
-    #     error_log.append(msg_header)
-    #     for val in sorted(missing_items):
-    #         # line = f"  - {val}"
-    #         line = f"{val}"
-    #         print(line)
-    #         error_log.append(line)
-
     extra_cols = []
     if include_unit_in_missing and 'unit' in df.columns and column != 'unit':
         extra_cols.append('unit')
@@ -109,7 +98,6 @@ def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True, i
                 line = str(val)
             print(line)
             error_log.append(line)
-
         
     if drop_unmapped:
         df = df.loc[mapped.notna()].copy()
@@ -118,12 +106,17 @@ def map_strict(df, column, mapping_dict, label, error_log, drop_unmapped=True, i
     return mapped
 
 def load_mapping_dict(file, sheet, src_col, tgt_col, conv_col=None):
-    # df = pd.read_excel(file, sheet_name=sheet, usecols=[src_col, tgt_col])
+    """
+    Loads a mapping dictionary from an Excel sheet. 
+    Used to load the various dictionary files from the global dictionary-Excel.
+    This includes the dictionary for variables, models, scenarios.
+    The dictionary for units is loaded with a different function, since it also includes conversion factors.
+    The dictionary for regions is also now loaded with a different function.
+    """
     df = pd.read_excel(file, sheet_name=sheet)
     if conv_col and conv_col not in df.columns:
         raise KeyError(f"Missing {conv_col} column in '{sheet}'.")
     if conv_col:
-        # Liefert dict: {source_unit: {'target': ..., 'factor': ...}}
         mapping = {}
         for _, row in df.iterrows():
             src = row[src_col]
@@ -133,7 +126,6 @@ def load_mapping_dict(file, sheet, src_col, tgt_col, conv_col=None):
                 mapping[src] = {'target': tgt, 'factor': factor if pd.notna(factor) else 1}
         return mapping
     else:
-        # alter fallback
         return pd.Series(df[tgt_col].values, index=df[src_col]).to_dict()
 
 def load_unit_pair_to_factor(file, sheet="units",
@@ -183,39 +175,6 @@ def load_variable_target_units(file, sheet="variables", var_col="DE variable nam
 
     df = df[df[var_col].notna() & (df[var_col] != "") & df[unit_col].notna() & (df[unit_col] != "")]
     return df.set_index(var_col)[unit_col].to_dict()
-
-
-# def build_unit_pair_maps(dict_unit):
-#     """
-#     Build lookup dict from dict_unit (loaded via load_mapping_dict with conversion_factor).
-#     Returns:
-#       pair_to_factor: {(src_unit, tgt_unit) -> factor}
-#       src_to_tgt_set: {src_unit -> set(tgt_unit)} (optional, useful for debugging)
-#     """
-#     pair_to_factor = {}
-#     src_to_tgt_set = {}
-
-#     for src, v in dict_unit.items():
-#         # dict_unit entries look like: src -> {'target': ..., 'factor': ...}
-#         if not isinstance(v, dict):
-#             continue
-
-#         tgt = v.get("target")
-#         factor = v.get("factor", 1)
-
-#         if pd.isna(src) or pd.isna(tgt):
-#             continue
-
-#         src_s = _norm_cell(src, empty_as_none=False)
-#         tgt_s = _norm_cell(tgt, empty_as_none=False)
-
-#         if not src_s or not tgt_s:
-#             continue
-
-#         pair_to_factor[(src_s, tgt_s)] = factor
-#         src_to_tgt_set.setdefault(src_s, set()).add(tgt_s)
-
-#     return pair_to_factor, src_to_tgt_set
 
 def load_mapping_with_conflicts(file, sheet, src_col, tgt_col, *, extra_cols=None):
     """
@@ -419,10 +378,6 @@ def _next_copy_path(path: str, i: int) -> str:
     p = Path(path)
     return str(p.with_name(f"{p.stem}_copy{i}{p.suffix}"))
 
-
-error_log = []
-fatal_issues = []  # list of strings (global)
-
 def log_error(msg, *, fatal=False):
     """Log to terminal and error_log; optionally also to fatal_issues."""
     # print: fatal in red, sonst gelb/cyan je nach Geschmack
@@ -441,26 +396,12 @@ def log_error(msg, *, fatal=False):
 print(f"Loading dictionary from: {DICTIONARY_FILE_PATH}")
 
 dict_variable = load_mapping_dict(DICTIONARY_FILE_PATH, 'variables', 'names mapping', 'DE variable name')
-# NEW: variable -> target unit (from variables-sheet)
-var_to_target_unit = load_variable_target_units(
-    DICTIONARY_FILE_PATH,
-    sheet="variables",
-    var_col="DE variable name",
-    unit_col="unit"
-)
-
-# dict_region   = load_mapping_dict(DICTIONARY_FILE_PATH, 'regions', 'source_region', 'target_region')
 dict_model    = load_mapping_dict(DICTIONARY_FILE_PATH, 'models', 'source_models', 'target_models')
 dict_scenario = load_mapping_dict(DICTIONARY_FILE_PATH, 'scenarios', 'source_scenario', 'target_scenario')
-# dict_unit     = load_mapping_dict(DICTIONARY_FILE_PATH, 'units', 'source_unit', 'target_unit', 'conversion_factor')
-# dict_unit_target = {k: v['target'] for k, v in dict_unit.items()}
-# dict_unit_factor = {k: v['factor'] for k, v in dict_unit.items()}
-# NEW: (source_unit, target_unit) -> conversion_factor
+
+# NEW: variable -> target unit (from variables-sheet)
+var_to_target_unit = load_variable_target_units(DICTIONARY_FILE_PATH, 'variables', 'DE variable name', 'unit')
 unit_pair_to_factor = load_unit_pair_to_factor(DICTIONARY_FILE_PATH, sheet="units")
-print(f"{len(unit_pair_to_factor)} unit conversion pairs loaded from units-sheet.")
-
-print(f"{len(var_to_target_unit)} variable target units loaded from variables-sheet.")
-
 
 # new - stricter loading of regions to catch duplicates and mapping issues early (since regions are often the main source of headaches in such mappings)
 countries_map, regions_map_by_model, region_conflicts, df_region_dict = load_region_mapping_model_aware(
@@ -488,19 +429,19 @@ if region_conflicts.get("regions_bad_format"):
 if region_conflicts.get("regions_ambiguous"):
     log_error(f"[Dictionary] Model-specific region mappings ambiguous: {len(region_conflicts['regions_ambiguous'])}", fatal=False)
     
+
 print(f"{len(dict_variable)} variables loaded from dictionary.")
-print(f"{len(countries_map)} country region mappings loaded (unique).")
-print(f"{len(regions_map_by_model)} model-specific region mappings loaded (unique).")
 print(f"{len(dict_model)} models loaded from dictionary.")
 print(f"{len(dict_scenario)} scenarios loaded from dictionary.\n")
-# print(f"{len(dict_unit)} units loaded from dictionary.\n")
+
+print(f"{len(var_to_target_unit)} variable target units loaded from variables-sheet.")
+print(f"{len(unit_pair_to_factor)} unit conversion pairs loaded from units-sheet.")
+
+print(f"{len(countries_map)} country region mappings loaded (unique).")
+print(f"{len(regions_map_by_model)} model-specific region mappings loaded (unique).")
 
 # ============================================================
-# 2. Initialisierung & Hilfsklassen
-# ============================================================
-
-# ============================================================
-# 3. Mapping-Datei laden
+# 2. Mapping-Datei laden
 # ============================================================
 
 print(f"Reading dictionary file: {MAPPING_FILE_PATH}")
@@ -512,19 +453,11 @@ except FileNotFoundError:
     sys.exit(1)
 
 # ============================================================
-# 4. Gruppierung nach Quell-Dateien
+# 3. Gruppierung nach Quell-Dateien
 # ============================================================
 
 grouped_mappings = df_mapping_full.groupby(['File location', 'File name', 'Source model'])
 print(f"\n{len(grouped_mappings)} unique files for processing found.")
-
-# ============================================================
-# TO DO next steps:
-# model_groups = df_mapping_full.groupby('Source model')
-
-
-# ============================================================
-
 
 # ============================================================
 # current time for runtime measurement
@@ -534,7 +467,7 @@ elapsed = cur_time - start_time
 print(f"\n⏱️ Runtime so far: {elapsed:.2f} Seconds\n")
 
 # ============================================================
-# 5. Process all files grouped by model
+# 4. Process all files grouped by model
 # ============================================================
 
 # Group only by model so all files of one model are collected together
@@ -546,7 +479,6 @@ for model_raw, model_group in model_groups:
 
     print(Fore.CYAN + Style.BRIGHT + f"\n=== Processing model: {model_key} (source: {model_raw}) ===" + Style.RESET_ALL)
     error_log.append(f"\n=== {model_key} (source: {model_raw}) ===")
-
 
     df_model_all = []  # collect IAMC data for each file of this model
 
@@ -591,9 +523,8 @@ for model_raw, model_group in model_groups:
             error_log.append(msg)
             continue
 
-        # NEW - also process files which are already in the IAMC format
         # ----------------------------------------------------
-        # Optional: Handle files that are already in pyam/IAMC format
+        # Also process files which are already in the IAMC format
         # ----------------------------------------------------
         pyam_like = all(
             any(str(year).isdigit() for year in df_input.columns)
@@ -617,7 +548,6 @@ for model_raw, model_group in model_groups:
 
             # Nur gültige Zeilen behalten
             df_input.dropna(subset=["year", "value"], inplace=True)
-
 
         # ----------------------------------------------------
         # 5.1.2  Standardize column names using aliases
@@ -795,23 +725,13 @@ for model_raw, model_group in model_groups:
             error_log.append(msg)
             df_input['region'] = pd.Series(dtype='string')
 
-        # old
-        # _targets = set(dict_region.values())
-        # dict_region_allow_target = dict(dict_region)
-        # dict_region_allow_target.update({t: t for t in _targets if pd.notna(t)})
-        
-        # build allow-target mapping
-        
+        # build allow-target mapping        
         df_input['variable'] = map_strict(df_input, 'original_variable', dict_variable, 'Variables', error_log, include_unit_in_missing=True)
         # df_input['region']   = map_strict(df_input, 'region', dict_region, 'Regions', error_log)
         # df_input['region'] = map_strict(df_input, 'region', dict_region_allow_target, 'Regions', error_log)
         df_input['scenario'] = map_strict(df_input, 'scenario', dict_scenario, 'Scenarios', error_log, include_unit_in_missing=False)
         
         # --- Convert units into desired target unit/dimension
-        # get conversion factor from dictionary (default to 1 if not found)
-        # df_input['conversion_factor'] = df_input['unit'].map(dict_unit_factor).fillna(1)
-
-        # recalculate values based on conversion factor (if unit was found in dict, otherwise keep original value)
         # --- Ensure numeric values before applying conversion factor
         df_input['value'] = pd.to_numeric(
             df_input['value']
@@ -830,11 +750,7 @@ for model_raw, model_group in model_groups:
             error_log.append(msg)
             for _, r in bad_value_rows.iterrows():
                 error_log.append(str(r.to_dict()))
-        # df_input['value'] = df_input['value'] * df_input['conversion_factor']
-
-        # rename unit to target unit (if found in dict, otherwise keep original unit)
-        # --- Units (NEW): variable-driven target unit + conversion via (source_unit, target_unit) rules
-
+        
         # target unit per row (from variables-sheet; df_input['variable'] must be canonical)
         df_input['desired_unit'] = df_input['variable'].map(var_to_target_unit)
         
@@ -989,7 +905,7 @@ for model_raw, model_group in model_groups:
     # --------------------------------------------------------
     dup_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'year']
     dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
-
+    
     if dupe_mask.any():
         dup_count = dupe_mask.sum()
         msg = f"\n [Check] Found {dup_count} duplicate rows for model {model_key}. Identical-valued duplicates will be removed; differing ones will be suffixed."
@@ -1030,10 +946,8 @@ for model_raw, model_group in model_groups:
         print(msg)
         error_log.append(msg)
 
-    # IMPORTANT: dupe_mask is now outdated because we changed 'region'
-    dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
     # --------------------------------------------------------
-    # 5.4. Pivotieren & Speichern (safe even with renamed duplicates)
+    # 4.x Pivot & save (save even with renamed duplicates)
     # --------------------------------------------------------
     try:
         final_out_file = None
@@ -1121,7 +1035,7 @@ for model_raw, model_group in model_groups:
     print(f"\n⏱️ Runtime so far: {cur_time - start_time:.2f} Seconds\n")
     
 # ============================================================
-# 6. Abschluss & Logs
+# 5. Finalization & Logs
 # ============================================================
 if fatal_issues:
     print(Fore.RED + Style.BRIGHT + "\n❌ Fatal dictionary issues detected. See error_log.txt for details." + Style.RESET_ALL)
