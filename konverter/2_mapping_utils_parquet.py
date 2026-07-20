@@ -421,10 +421,13 @@ def build_original_variable(df: pd.DataFrame, mapping_source_columns: str) -> pd
     if missing:
         raise KeyError(f"Columns {missing} not found.")
 
-    # Fast concatenation (avoid apply(axis=1) for big data)
-    s = df[cols[0]].astype('string').fillna('')
-    for c in cols[1:]:
-        s = s + '|' + df[c].astype('string').fillna('')
+    # cast+fill once per column (instead of inside the loop repeatedly)
+    prepared = [df[c].astype('string').fillna('') for c in cols]
+
+    s = prepared[0]
+    for part in prepared[1:]:
+        s = s + '|' + part
+
     return s.str.strip()
 
 def ensure_numeric_value(series: pd.Series) -> pd.Series:
@@ -449,7 +452,35 @@ def build_concat_expr(cols):
     # Cast to VARCHAR and coalesce NULL -> '' so concat doesn't become NULL
     parts = [f"COALESCE(CAST({q_ident(c)} AS VARCHAR), '')" for c in cols]
     return " || '|' || ".join(parts)
-# ============================================================
+
+EXCEL_MAX_ROWS = 1_048_576
+def pack_scenarios(rows_per_scenario: pd.Series, max_rows: int):
+    """
+    rows_per_scenario: Series index=scenario, values=rowcount (already sorted in desired order)
+    Returns: list[list[scenario]] bins where sum(rows) <= max_rows
+    Raises if a single scenario exceeds max_rows.
+    """
+    bins = []
+    current = []
+    current_rows = 0
+
+    for scen, n in rows_per_scenario.items():
+        n = int(n)
+        if n > max_rows:
+            raise ValueError(f"Scenario '{scen}' has {n:,} rows which exceeds Excel limit per file ({max_rows:,}).")
+
+        if current and (current_rows + n > max_rows):
+            bins.append(current)
+            current = []
+            current_rows = 0
+
+        current.append(scen)
+        current_rows += n
+
+    if current:
+        bins.append(current)
+
+    return bins# ============================================================
 # 1. Dictionary-Dateien laden
 # ============================================================
 
@@ -557,7 +588,7 @@ for model_raw, model_group in model_groups:
         error_log.append(f"\n--- {file_name} ---")
 
         # ----------------------------------------------------
-        # Read source file (.xlsx or .csv)
+        # Read source file (.xlsx, .csv or .parquet) into pandas DataFrame
         # ----------------------------------------------------
         sheet_name = config.get('Sheet name', 0) or 0
         t = time.time()
@@ -574,6 +605,23 @@ for model_raw, model_group in model_groups:
                 sep = config['Separator'] if config['Separator'] else ','
                 df_input = pd.read_csv(INPUT_FILE_PATH, sep=sep, low_memory=False, engine="c", dtype_backend="numpy_nullable")
                 df_input.dropna(how='all', inplace=True)
+                
+                
+                # 1) header only
+                cols = pd.read_csv(INPUT_FILE_PATH, sep=sep, nrows=0).columns.tolist()
+                
+                resolved = resolve_columns_from_aliases(cols, COLUMN_ALIASES, ['scenario','region','year','value','unit'])
+                missing_base = [c for c in ['scenario','region','year','value','unit'] if c not in resolved]
+                if missing_base:
+                    raise KeyError(f"CSV missing required base columns (by alias): {missing_base}. Available: {cols}")
+
+                base_needed = list(resolved.values())
+                extra_needed = parse_pipe_columns(mapping_source_columns)
+
+                usecols = list(dict.fromkeys(base_needed + extra_needed))
+
+                # 2) full read but only needed cols
+                df_input = pd.read_csv(INPUT_FILE_PATH, sep=sep, usecols=usecols, low_memory=False, engine="c")
             
             elif file_name.lower().endswith('.parquet'):
                 # import pyarrow.dataset as ds
@@ -621,7 +669,7 @@ for model_raw, model_group in model_groups:
                 
                 # 6) normalize string-like columns to pandas string dtype (consistent behavior)
                 # only for parquet - maybe for others, too?
-                for c in extra_needed:
+                for c in missing_base:
                     if c in df_input.columns:
                         df_input[c] = df_input[c].astype('string')
                 
@@ -679,6 +727,7 @@ for model_raw, model_group in model_groups:
                     df_input.rename(columns={variant: canonical}, inplace=True)
                     break
         found_cols = [c for c in ["scenario", "region", "year", "value", "unit"] if c in df_input.columns]
+            
         print(f"Standardized columns: {found_cols}")
         print("[TIMING] alias", time.time()-t); t=time.time()
 
@@ -687,7 +736,6 @@ for model_raw, model_group in model_groups:
         # ----------------------------------------------------
         # bei Parquet-Dateien wird die Spalte 'original_variable' bereits beim Lesen erstellt, daher ist der folgende Schritt nur für andere Formate relevant.
         # df_input['original_variable'] = build_original_variable(df_input, mapping_source_columns)
-        print(df_input.columns.tolist())
 
         if 'original_variable' not in df_input.columns:
             try:
@@ -725,7 +773,9 @@ for model_raw, model_group in model_groups:
             df_input.dropna(subset=["value"], inplace=True)
             df_input.reset_index(drop=True, inplace=True)
 
-
+        # numeric value + apply factor (your existing parse logic)
+        df_input['value'] = ensure_numeric_value(df_input['value']) 
+        
         # ----------------------------------------------------
         # Dictionary mapping
         # ----------------------------------------------------
@@ -830,7 +880,6 @@ for model_raw, model_group in model_groups:
                 # drop unmapped rows
                 df_input = df_input.loc[~missing_mask].copy()
                 final_region = final_region.loc[~missing_mask].copy()
-
 
             df_input['region'] = final_region
         else:
@@ -948,10 +997,7 @@ for model_raw, model_group in model_groups:
 
         # set final unit to desired_unit where available
         df_input.loc[has_des, 'unit'] = df_input.loc[has_des, 'desired_unit']
-
-        # numeric value + apply factor (your existing parse logic)
-        df_input['value'] = ensure_numeric_value(df_input['value']) 
-        
+       
         # optional cleanup
         df_input.drop(columns=['desired_unit'], inplace=True, errors='ignore')
 
@@ -1090,53 +1136,123 @@ for model_raw, model_group in model_groups:
 
         n_conflict_rows = int(conflict_mask.sum())
         n_conflict_series = int(df_output.loc[conflict_mask, series_cols].drop_duplicates().shape[0]) if n_conflict_rows else 0
+        if not df_dups_output is None and not df_dups_output.empty:
+            print("[DEBUG] There are duplicates; writing to separate sheet in output file.")        
         if (n_conflict_rows > 0):
             print(f"[DEBUG] True conflicts: {n_conflict_series:,} series, {n_conflict_rows:,} rows")
 
-        if df_dups_output is None or df_dups_output.empty:
-            print("[DEBUG] df_dups_output is None/empty")        
             
         # cleanup
         df_output.drop(columns=['__sig'], inplace=True, errors='ignore')
 
-        out_file = os.path.join(OUTPUT_FOLDER, f"pyam_{model_key}.xlsx")
-        # os.makedirs(os.path.dirname(out_file), exist_ok=True)
-        # df_output.to_excel(out_file, index=False, sheet_name='pyam_data')
-        
-        # If there are no true conflicts, drop source columns from the main data sheet
-        if not conflict_mask.any():
-            df_output.drop(columns=['file_location', 'file_name'], inplace=True, errors='ignore')
-    
-        for i in range(0, 26):
-            candidate = out_file if i == 0 else _next_copy_path(out_file, i)
-            try:
-                os.makedirs(os.path.dirname(out_file), exist_ok=True)
-                # df_output.to_excel(candidate, index=False, sheet_name='pyam_data')
+        # for i in range(0, 26):
+        #     candidate = out_file if i == 0 else _next_copy_path(out_file, i)
+        #     try:
+        #         os.makedirs(os.path.dirname(out_file), exist_ok=True)
+        #         # df_output.to_excel(candidate, index=False, sheet_name='pyam_data')
                 
-                # with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
-                #     df_output.to_excel(writer, index=False, sheet_name="data") # renamed from 'pyam_data' to 'data' to pass upload
+        #         # with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
+        #         #     df_output.to_excel(writer, index=False, sheet_name="data") # renamed from 'pyam_data' to 'data' to pass upload
 
-                #     # write duplicates sheet only if it exists
-                #     if df_dups_output is not None and not df_dups_output.empty:
-                #         df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
-                with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
-                    df_output.to_excel(writer, index=False, sheet_name="data")
-                    if df_dups_output is not None and not df_dups_output.empty:
-                        df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
-                final_out_file = candidate
-                if i > 0:
-                    msg = f"\n[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
-                    print(Fore.YELLOW + msg + Style.RESET_ALL)
-                    error_log.append(msg)
-                break
-            except PermissionError:
-                continue
-            
-        if final_out_file is None:
-            raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
+        #         #     # write duplicates sheet only if it exists
+        #         #     if df_dups_output is not None and not df_dups_output.empty:
+        #         #         df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
+        #         with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
+        #             df_output.to_excel(writer, index=False, sheet_name="data")
+        #             if df_dups_output is not None and not df_dups_output.empty:
+        #                 df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
+        #         final_out_file = candidate
+        #         if i > 0:
+        #             msg = f"\n[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
+        #             print(Fore.YELLOW + msg + Style.RESET_ALL)
+        #             error_log.append(msg)
+        #         break
+        #     except PermissionError:
+        #         continue
+        
+        # --------------------------------------------------------
+        # It is possible that models create very large files (e.g. CITS)
+        # Then, the Excel limit of 1,048,576 rows is exceeded. 
+        # In that case, we need to split the output into multiple files.
+        # --------------------------------------------------------
+        # Split into multiple Excel files if Excel row limit is exceeded
+        # (Option A: pack scenarios into as few files as possible)
+        # --------------------------------------------------------
+        ROW_MARGIN = 10_000  # safety buffer for header/edge cases
+        max_rows_per_file = EXCEL_MAX_ROWS - ROW_MARGIN
 
-        output_msg_dups = "(with duplicates marked)" if conflict_mask.any() else ""
-        print(Fore.GREEN + f"✅ Saved combined {output_msg_dups} file for model: {model_key} as {final_out_file}" + Style.RESET_ALL)
+        total_rows = len(df_output)
+
+        # Build list of (suffix, dataframe_part)
+        parts = []
+
+        if total_rows <= EXCEL_MAX_ROWS:
+            parts = [("", df_output)]
+        else:
+            # rows per scenario, sorted desc for best packing (fewer files)
+            rows_per_scen = (
+                df_output.groupby("scenario", dropna=False)
+                .size()
+                .sort_values(ascending=False)
+            )
+
+            scenario_bins = pack_scenarios(rows_per_scen, max_rows=max_rows_per_file)
+
+            # suffix naming: scen01-05, scen06-10, ... based on scenario count in packing order
+            scen_counter = 0
+            for bin_scenarios in scenario_bins:
+                start = scen_counter + 1
+                scen_counter += len(bin_scenarios)
+                end = scen_counter
+
+                suffix = f"scen{start:02d}-{end:02d}"
+                df_part = df_output[df_output["scenario"].isin(bin_scenarios)].copy()
+                parts.append((suffix, df_part))
+
+            msg = f"[Save] Output exceeds Excel row limit ({total_rows:,} rows). Writing {len(parts)} files grouped by scenario."
+            print(Fore.YELLOW + msg + Style.RESET_ALL)
+            error_log.append(msg)
+        
+        # If there are no true conflicts, drop source columns from the main data sheet (for every part)
+        KEEP_SOURCE_COLS = True  # set False for final export after dedup
+        if (not KEEP_SOURCE_COLS) and (not conflict_mask.any()):
+            parts = [(suffix, df_part.drop(columns=['file_location','file_name'], errors='ignore'))
+                    for suffix, df_part in parts]
+                
+        out_base = os.path.join(OUTPUT_FOLDER, f"pyam_{model_key}")
+
+        for suffix, df_part in parts:
+            out_file = out_base + ("" if suffix == "" else f"_{suffix}") + ".xlsx"
+
+            final_out_file = None
+            for i in range(0, 26):
+                candidate = out_file if i == 0 else _next_copy_path(out_file, i)
+                try:
+                    os.makedirs(os.path.dirname(out_file), exist_ok=True)
+
+                    with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
+                        df_part.to_excel(writer, index=False, sheet_name="data")
+
+                        # duplicates sheet only if it exists (optional: you can also split it later)
+                        if df_dups_output is not None and not df_dups_output.empty:
+                            # For now: write duplicates ONLY when not splitting, or if you want you can split it similarly by scenario.
+                            # Simplest behavior: only write duplicates when not split:
+                            if suffix == "":
+                                df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
+
+                    final_out_file = candidate
+                    if i > 0:
+                        msg = f"[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
+                        print(Fore.YELLOW + msg + Style.RESET_ALL)
+                        error_log.append(msg)
+                    break
+                except PermissionError:
+                    continue
+
+            if final_out_file is None:
+                raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
+
+            print(Fore.GREEN + f"✅ Saved file for model {model_key}: {final_out_file}" + Style.RESET_ALL)
 
     except Exception as e:
         msg = f"ERROR during pivot/save for model {model_key}: {e}"
