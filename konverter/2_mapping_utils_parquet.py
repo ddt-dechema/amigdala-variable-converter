@@ -1,6 +1,9 @@
 #%%
 import pandas as pd
 import pyarrow.parquet as pq
+import pyarrow.dataset as ds
+import duckdb
+
 import os, sys, time, gc
 from pathlib import Path
 import re
@@ -222,6 +225,7 @@ def load_mapping_with_conflicts(file, sheet, src_col, tgt_col, *, extra_cols=Non
     mapping_unique = pd.Series(df_unique_nonblank[tgt_col].values, index=df_unique_nonblank[src_col]).to_dict()
 
     return mapping_unique, conflicts, df
+
 def load_region_mapping_model_aware(file, sheet="regions",
                                    src_col="source_region", tgt_col="target_region",
                                    folder_col="folder", model_sep="|"):
@@ -373,8 +377,7 @@ def load_context_mapping(file, sheet, key_cols, value_cols):
 
     # return as dict of dict for readability
     return {k: {value_cols[i]: v[i] for i in range(len(value_cols))} for k, v in mapping.items()}
-
-        
+     
 def _next_copy_path(path: str, i: int) -> str:
     p = Path(path)
     return str(p.with_name(f"{p.stem}_copy{i}{p.suffix}"))
@@ -395,7 +398,6 @@ def parse_pipe_columns(spec: str):
         return []
     return [c.strip() for c in spec.split('|')] if '|' in spec else [spec]
 
-
 def resolve_columns_from_aliases(existing_cols, column_aliases, canonical_needed):
     """
     existing_cols: iterable of column names in the file (original)
@@ -409,7 +411,6 @@ def resolve_columns_from_aliases(existing_cols, column_aliases, canonical_needed
                 resolved[canonical] = variant
                 break
     return resolved
-
 
 def build_original_variable(df: pd.DataFrame, mapping_source_columns: str) -> pd.Series:
     cols = parse_pipe_columns(mapping_source_columns)
@@ -425,7 +426,29 @@ def build_original_variable(df: pd.DataFrame, mapping_source_columns: str) -> pd
     for c in cols[1:]:
         s = s + '|' + df[c].astype('string').fillna('')
     return s.str.strip()
-            
+
+def ensure_numeric_value(series: pd.Series) -> pd.Series:
+    # Fast path: already numeric (parquet)
+    if series.dtype.kind in "if":  # int/float
+        return series.astype("float64", copy=False)
+
+    # Slow path: string cleanup (csv/excel)
+    return pd.to_numeric(
+        series.astype("string")
+            .str.replace(" ", "", regex=False)
+            .str.replace("\u00A0", "", regex=False)
+            .str.replace(",", ".", regex=False),
+        errors="coerce"
+    )            
+
+def q_ident(name: str) -> str:
+    # DuckDB identifier quoting; double quotes inside name must be escaped
+    return '"' + name.replace('"', '""') + '"'
+
+def build_concat_expr(cols):
+    # Cast to VARCHAR and coalesce NULL -> '' so concat doesn't become NULL
+    parts = [f"COALESCE(CAST({q_ident(c)} AS VARCHAR), '')" for c in cols]
+    return " || '|' || ".join(parts)
 # ============================================================
 # 1. Dictionary-Dateien laden
 # ============================================================
@@ -537,6 +560,8 @@ for model_raw, model_group in model_groups:
         # Read source file (.xlsx or .csv)
         # ----------------------------------------------------
         sheet_name = config.get('Sheet name', 0) or 0
+        t = time.time()
+
         try:
             if file_name.lower().endswith('.xlsx'):
                 df_input = pd.read_excel(
@@ -550,33 +575,62 @@ for model_raw, model_group in model_groups:
                 df_input = pd.read_csv(INPUT_FILE_PATH, sep=sep, low_memory=False, engine="c", dtype_backend="numpy_nullable")
                 df_input.dropna(how='all', inplace=True)
             
-            elif file_name.lower().endswith('.parquet'): # CITS uses parquet
-                # 1) read schema column names fast (no data load)
+            elif file_name.lower().endswith('.parquet'):
+                # import pyarrow.dataset as ds
+
+                # 1) Read schema (no data)
                 parquet_cols = pq.ParquetFile(INPUT_FILE_PATH).schema.names
 
-                # 2) resolve base columns via COLUMN_ALIASES (scenario/region/year/value/unit)
+                # 2) Resolve base columns (scenario/region/year/value/unit) via aliases
                 resolved = resolve_columns_from_aliases(
                     parquet_cols,
                     COLUMN_ALIASES,
                     canonical_needed=['scenario', 'region', 'year', 'value', 'unit']
                 )
-
-                missing_base = [c for c in ['scenario','region','year','value','unit'] if c not in resolved]
+                missing_base = [c for c in ['scenario', 'region', 'year', 'value', 'unit'] if c not in resolved]
                 if missing_base:
-                    raise KeyError(f"Parquet is missing required base columns (by alias): {missing_base}. "
-                                f"Available columns: {parquet_cols}")
+                    raise KeyError(
+                        f"Parquet is missing required base columns (by alias): {missing_base}. "
+                        f"Available columns: {parquet_cols}"
+                    )
 
                 base_needed = list(resolved.values())
 
-                # 3) add variable-source columns (exact names from mapping excel)
+                # 3) Add variable-source columns (exact from mapping excel)
                 extra_needed = parse_pipe_columns(mapping_source_columns)
 
+                # 4) Final list of columns to read
                 needed_cols = list(dict.fromkeys(base_needed + extra_needed))
+                
+                # 5) prepare SQL statement           
+                # use duckdb to concatenate the columns directly
+                # make the SQL statement dynamic based on the columns we need to read
+                parts = parse_pipe_columns(mapping_source_columns)  
 
-                print("[DEBUG] parquet needed cols:", needed_cols)
+                base_sql = ", ".join(q_ident(c) for c in base_needed)
 
-                df_input = pd.read_parquet(INPUT_FILE_PATH, columns=needed_cols)
-
+                orig_expr = build_concat_expr(parts) + " AS original_variable"
+                
+                sql= f"""
+                SELECT {base_sql}, {orig_expr}
+                FROM read_parquet('{INPUT_FILE_PATH}')
+                """
+                
+                con = duckdb.connect(database=":memory:")
+                df_input = con.execute(sql).fetch_df()
+                
+                # 6) normalize string-like columns to pandas string dtype (consistent behavior)
+                # only for parquet - maybe for others, too?
+                for c in extra_needed:
+                    if c in df_input.columns:
+                        df_input[c] = df_input[c].astype('string')
+                
+                # 6) Hard validation
+                # missing_after = [c for c in needed_cols if c not in df_input.columns]
+                missing_after = [c for c in base_needed if c not in df_input.columns]
+                
+                if missing_after:
+                    raise KeyError(f"Parquet read returned missing columns: {missing_after}. Got: {list(df_input.columns)}")
             else:
                 msg = f"WARNING: Unknown Format – skipped: {file_name}"
                 print(msg)
@@ -588,7 +642,8 @@ for model_raw, model_group in model_groups:
             print(msg)
             error_log.append(msg)
             continue
-
+        
+        print(f"[TIMING] read took {time.time()-t:.2f}s")
         # ----------------------------------------------------
         # Also process files which are already in the IAMC format
         # ----------------------------------------------------
@@ -625,18 +680,27 @@ for model_raw, model_group in model_groups:
                     break
         found_cols = [c for c in ["scenario", "region", "year", "value", "unit"] if c in df_input.columns]
         print(f"Standardized columns: {found_cols}")
+        print("[TIMING] alias", time.time()-t); t=time.time()
 
         # ----------------------------------------------------
         # Variable column preparation
         # ----------------------------------------------------
+        # bei Parquet-Dateien wird die Spalte 'original_variable' bereits beim Lesen erstellt, daher ist der folgende Schritt nur für andere Formate relevant.
+        # df_input['original_variable'] = build_original_variable(df_input, mapping_source_columns)
+        print(df_input.columns.tolist())
 
-        try:
-            df_input['original_variable'] = build_original_variable(df_input, mapping_source_columns)
-        except KeyError as e:
-            msg = f"ERROR: {e}. Skipping file {file_name}"
-            print(msg)
-            error_log.append(msg)
-            continue
+        if 'original_variable' not in df_input.columns:
+            try:
+                df_input['original_variable'] = build_original_variable(df_input, mapping_source_columns)
+            except KeyError as e:
+                msg = f"ERROR: {e}. Skipping file {file_name}"
+                print(msg)
+                error_log.append(msg)
+                continue
+        else:        
+            print("[DEBUG] original_variable already present; skipping build.")
+            pass
+        print("[TIMING] origvar", time.time()-t); t=time.time()
 
         # ----------------------------------------------------
         # Detect and handle IAMC/pyam wide-format files
@@ -776,22 +840,14 @@ for model_raw, model_group in model_groups:
             df_input['region'] = pd.Series(dtype='string')
 
         # build allow-target mapping        
-        df_input['variable'] = map_strict(df_input, 'original_variable', dict_variable, 'Variables', error_log, include_unit_in_missing=True)
-        # df_input['region']   = map_strict(df_input, 'region', dict_region, 'Regions', error_log)
-        # df_input['region'] = map_strict(df_input, 'region', dict_region_allow_target, 'Regions', error_log)
-        df_input['scenario'] = map_strict(df_input, 'scenario', dict_scenario, 'Scenarios', error_log, include_unit_in_missing=False)
+        df_input['variable'] = map_strict(df_input, 'original_variable', dict_variable, 'Variables', error_log, include_unit_in_missing=True)        
+        # after variable mapping: drop unmapped rows immediately
+        df_input = df_input[df_input['variable'].notna()].copy()     
         
-        # --- Convert units into desired target unit/dimension
-        # --- Ensure numeric values before applying conversion factor
-        df_input['value'] = pd.to_numeric(
-            df_input['value']
-                .astype('string')
-                .str.replace(' ', '', regex=False)     # remove thousands spaces
-                .str.replace('\u00A0', '', regex=False) # remove NBSP if present
-                .str.replace(',', '.', regex=False),   # decimal comma -> dot
-            errors='coerce'
-        )
-
+        df_input['scenario'] = map_strict(df_input, 'scenario', dict_scenario, 'Scenarios', error_log, include_unit_in_missing=False)
+        # again: after scenario mapping: drop unmapped rows immediately
+        df_input = df_input[df_input['scenario'].notna()].copy()   
+        
         # Optional: log rows where value couldn't be parsed
         bad_value_rows = df_input.loc[df_input['value'].isna(), ['original_variable'] + (['unit'] if 'unit' in df_input.columns else [])].head(20)
         if not bad_value_rows.empty:
@@ -894,17 +950,8 @@ for model_raw, model_group in model_groups:
         df_input.loc[has_des, 'unit'] = df_input.loc[has_des, 'desired_unit']
 
         # numeric value + apply factor (your existing parse logic)
-        df_input['value'] = pd.to_numeric(
-            df_input['value']
-                .astype('string')
-                .str.replace(' ', '', regex=False)
-                .str.replace('\u00A0', '', regex=False)
-                .str.replace(',', '.', regex=False),
-            errors='coerce'
-        )
-
-        df_input['value'] = df_input['value'] * df_input['conversion_factor'].fillna(1)
-
+        df_input['value'] = ensure_numeric_value(df_input['value']) 
+        
         # optional cleanup
         df_input.drop(columns=['desired_unit'], inplace=True, errors='ignore')
 
@@ -950,62 +997,12 @@ for model_raw, model_group in model_groups:
 
     df_model_combined = pd.concat(df_model_all, ignore_index=True, copy=False)
 
-    # # --------------------------------------------------------
-    # # Detect duplicates and mark them clearly
-    # # --------------------------------------------------------
-    # dup_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'year']
-    
-    # # set new global variable to None before checking for duplicates
-    # # dupes_initial = 0
-    
-    # dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
-    # # if dupe_mask.any():
-    # #     dupes_initial = 1
-    # #     print("Yes, there are duplicates")
-
-    # if dupe_mask.any():
-    #     dup_count = dupe_mask.sum()
-    #     msg = f"\n [Check] Found {dup_count} duplicate rows for model {model_key}. Identical-valued duplicates will be removed; differing ones will be suffixed."
-    #     print(Fore.YELLOW + msg + Style.RESET_ALL)
-    #     error_log.append(msg)
-
-    #     # identify duplicates grouped by keys
-    #     grouped_dupes = df_model_combined[dupe_mask].groupby(dup_cols, dropna=False)
-
-    #     rows_to_drop = set()
-    #     rows_to_rename = []
-
-    #     for key, group in grouped_dupes:
-    #         # If all 'value' entries in group are identical, mark all but first for deletion
-    #         if group['value'].nunique() == 1:
-    #             rows_to_drop.update(group.index[1:])
-    #         else:
-    #             # assign incremental IDs for visible duplicates
-    #             for i, idx in enumerate(group.index, start=1):
-    #                 rows_to_rename.append((idx, f"dup_{group.iloc[i-1]['region']}_{i}"))
-    #     # delete exact duplicates
-    #     if rows_to_drop:
-    #         df_model_combined.drop(index=list(rows_to_drop), inplace=True)
-    #         msg = f"Removed {len(rows_to_drop)} rows with identical duplicates for model {model_key}."
-    #         print(Fore.GREEN + msg + Style.RESET_ALL)
-    #         error_log.append(msg)
-
-    #     # rename only the true differing duplicates
-    #     if rows_to_rename:
-    #         for idx, new_name in rows_to_rename:
-    #             df_model_combined.at[idx, 'region'] = new_name
-
-    #         msg = f"Renamed {len(rows_to_rename)} remaining duplicate rows with 'dup_' prefix for model {model_key}."
-    #         print(Fore.GREEN + msg + Style.RESET_ALL)
-    #         error_log.append(msg)
-    # else:
-    #     msg = f"[Check] No duplicates found for model {model_key}."
-    #     print(msg)
-    #     error_log.append(msg)
+    print("[TIMING] mapping+conv", time.time()-t); t=time.time()
 
     # --------------------------------------------------------
     # 4.x Pivot & save (save even with renamed duplicates)
     # --------------------------------------------------------
+    
     try:
         final_out_file = None
         
@@ -1061,8 +1058,7 @@ for model_raw, model_group in model_groups:
             msg = f"[Check] Dropped {before-after} file-rows with identical time series (kept one representative)."
             print(Fore.GREEN + msg + Style.RESET_ALL)
             error_log.append(msg)
-
-        print(f"[DEBUG] Identical time series dropped: {before-after:,} (kept one representative per signature)")
+            print(f"[DEBUG] Identical time series dropped: {before-after:,} (kept one representative per signature)")
 
         # --------------------------------------------------------
         # 2) Conflicts: series that still have >1 distinct signature
@@ -1094,10 +1090,12 @@ for model_raw, model_group in model_groups:
 
         n_conflict_rows = int(conflict_mask.sum())
         n_conflict_series = int(df_output.loc[conflict_mask, series_cols].drop_duplicates().shape[0]) if n_conflict_rows else 0
-        print(f"[DEBUG] True conflicts: {n_conflict_series:,} series, {n_conflict_rows:,} rows")
+        if (n_conflict_rows > 0):
+            print(f"[DEBUG] True conflicts: {n_conflict_series:,} series, {n_conflict_rows:,} rows")
 
-        print(f"[DEBUG] df_dups_output: {'EMPTY/None' if (df_dups_output is None or df_dups_output.empty) else f'rows={len(df_dups_output):,}, cols={df_dups_output.shape[1]}'}")
-        
+        if df_dups_output is None or df_dups_output.empty:
+            print("[DEBUG] df_dups_output is None/empty")        
+            
         # cleanup
         df_output.drop(columns=['__sig'], inplace=True, errors='ignore')
 
@@ -1115,13 +1113,16 @@ for model_raw, model_group in model_groups:
                 os.makedirs(os.path.dirname(out_file), exist_ok=True)
                 # df_output.to_excel(candidate, index=False, sheet_name='pyam_data')
                 
-                with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
-                    df_output.to_excel(writer, index=False, sheet_name="data") # renamed from 'pyam_data' to 'data' to pass upload
+                # with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
+                #     df_output.to_excel(writer, index=False, sheet_name="data") # renamed from 'pyam_data' to 'data' to pass upload
 
-                    # write duplicates sheet only if it exists
+                #     # write duplicates sheet only if it exists
+                #     if df_dups_output is not None and not df_dups_output.empty:
+                #         df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
+                with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
+                    df_output.to_excel(writer, index=False, sheet_name="data")
                     if df_dups_output is not None and not df_dups_output.empty:
                         df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
-
                 final_out_file = candidate
                 if i > 0:
                     msg = f"\n[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
@@ -1150,6 +1151,8 @@ for model_raw, model_group in model_groups:
     cur_time = time.time()
     print(f"\n⏱️ Runtime so far: {cur_time - start_time:.2f} Seconds\n")
     
+    print("[TIMING] pivot+save", time.time()-t)
+
 # ============================================================
 # 5. Finalization & Logs
 # ============================================================

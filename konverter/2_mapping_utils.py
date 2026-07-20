@@ -900,58 +900,58 @@ for model_raw, model_group in model_groups:
 
     df_model_combined = pd.concat(df_model_all, ignore_index=True, copy=False)
 
-    # --------------------------------------------------------
-    # Detect duplicates and mark them clearly
-    # --------------------------------------------------------
-    dup_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'year']
+    # # --------------------------------------------------------
+    # # Detect duplicates and mark them clearly
+    # # --------------------------------------------------------
+    # dup_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'year']
     
-    # set new global variable to None before checking for duplicates
-    dupes_initial = 0
+    # # set new global variable to None before checking for duplicates
+    # # dupes_initial = 0
     
-    dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
-    if dupe_mask.any():
-        dupes_initial = 1
-        print("Yes, there are duplicates")
+    # dupe_mask = df_model_combined.duplicated(subset=dup_cols, keep=False)
+    # # if dupe_mask.any():
+    # #     dupes_initial = 1
+    # #     print("Yes, there are duplicates")
 
-    if dupe_mask.any():
-        dup_count = dupe_mask.sum()
-        msg = f"\n [Check] Found {dup_count} duplicate rows for model {model_key}. Identical-valued duplicates will be removed; differing ones will be suffixed."
-        print(Fore.YELLOW + msg + Style.RESET_ALL)
-        error_log.append(msg)
+    # if dupe_mask.any():
+    #     dup_count = dupe_mask.sum()
+    #     msg = f"\n [Check] Found {dup_count} duplicate rows for model {model_key}. Identical-valued duplicates will be removed; differing ones will be suffixed."
+    #     print(Fore.YELLOW + msg + Style.RESET_ALL)
+    #     error_log.append(msg)
 
-        # identify duplicates grouped by keys
-        grouped_dupes = df_model_combined[dupe_mask].groupby(dup_cols, dropna=False)
+    #     # identify duplicates grouped by keys
+    #     grouped_dupes = df_model_combined[dupe_mask].groupby(dup_cols, dropna=False)
 
-        rows_to_drop = set()
-        rows_to_rename = []
+    #     rows_to_drop = set()
+    #     rows_to_rename = []
 
-        for key, group in grouped_dupes:
-            # If all 'value' entries in group are identical, mark all but first for deletion
-            if group['value'].nunique() == 1:
-                rows_to_drop.update(group.index[1:])
-            else:
-                # assign incremental IDs for visible duplicates
-                for i, idx in enumerate(group.index, start=1):
-                    rows_to_rename.append((idx, f"dup_{group.iloc[i-1]['region']}_{i}"))
-        # delete exact duplicates
-        if rows_to_drop:
-            df_model_combined.drop(index=list(rows_to_drop), inplace=True)
-            msg = f"Removed {len(rows_to_drop)} rows with identical duplicates for model {model_key}."
-            print(Fore.GREEN + msg + Style.RESET_ALL)
-            error_log.append(msg)
+    #     for key, group in grouped_dupes:
+    #         # If all 'value' entries in group are identical, mark all but first for deletion
+    #         if group['value'].nunique() == 1:
+    #             rows_to_drop.update(group.index[1:])
+    #         else:
+    #             # assign incremental IDs for visible duplicates
+    #             for i, idx in enumerate(group.index, start=1):
+    #                 rows_to_rename.append((idx, f"dup_{group.iloc[i-1]['region']}_{i}"))
+    #     # delete exact duplicates
+    #     if rows_to_drop:
+    #         df_model_combined.drop(index=list(rows_to_drop), inplace=True)
+    #         msg = f"Removed {len(rows_to_drop)} rows with identical duplicates for model {model_key}."
+    #         print(Fore.GREEN + msg + Style.RESET_ALL)
+    #         error_log.append(msg)
 
-        # rename only the true differing duplicates
-        if rows_to_rename:
-            for idx, new_name in rows_to_rename:
-                df_model_combined.at[idx, 'region'] = new_name
+    #     # rename only the true differing duplicates
+    #     if rows_to_rename:
+    #         for idx, new_name in rows_to_rename:
+    #             df_model_combined.at[idx, 'region'] = new_name
 
-            msg = f"Renamed {len(rows_to_rename)} remaining duplicate rows with 'dup_' prefix for model {model_key}."
-            print(Fore.GREEN + msg + Style.RESET_ALL)
-            error_log.append(msg)
-    else:
-        msg = f"[Check] No duplicates found for model {model_key}."
-        print(msg)
-        error_log.append(msg)
+    #         msg = f"Renamed {len(rows_to_rename)} remaining duplicate rows with 'dup_' prefix for model {model_key}."
+    #         print(Fore.GREEN + msg + Style.RESET_ALL)
+    #         error_log.append(msg)
+    # else:
+    #     msg = f"[Check] No duplicates found for model {model_key}."
+    #     print(msg)
+    #     error_log.append(msg)
 
     # --------------------------------------------------------
     # 4.x Pivot & save (save even with renamed duplicates)
@@ -959,49 +959,106 @@ for model_raw, model_group in model_groups:
     try:
         final_out_file = None
         
-        has_dup_region = df_model_combined['region'].astype('string').str.startswith('dup_').any()
+        # --------------------------------------------------------
+        # Pivot: always one row per file (full time series)
+        # --------------------------------------------------------
+        idx_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'file_location', 'file_name']
+        series_cols = ['model', 'scenario', 'region', 'variable', 'unit']
 
-        if has_dup_region:
-            df_output = (
-                df_model_combined
-                .pivot(index=['model', 'scenario', 'region', 'variable', 'unit'
-                            , 'file_location', 'file_name'], # new. to facilitate the detection of duplicates
-                    columns='year', values='value')
-                .reset_index()
+        df_output = (
+            df_model_combined
+            .pivot_table(
+                index=idx_cols,
+                columns='year',
+                values='value',
+                aggfunc='first'   # robust if same (idx,year) appears twice
             )
-        else:
-            df_output = (
-                df_model_combined
-                .pivot(index=['model', 'scenario', 'region', 'variable', 'unit'],
-                    columns='year', values='value')
-                .reset_index()
-            )
-                
-        df_output.columns = [str(col) for col in df_output.columns]
-        
-        # --- Build duplicates sheet (only if duplicates exist) ---
+            .reset_index()
+        )
+
+        print(f"[DEBUG] After pivot: df_output rows={len(df_output):,} (one row per file/series)")
+
+        # normalize column names to strings
+        df_output.columns = [str(c) for c in df_output.columns]
+
+        # year columns (after pivot)
+        year_cols = [c for c in df_output.columns if c.isdigit()]
+
+        # --------------------------------------------------------
+        # Build time-series signature per row (for "identical series" detection)
+        # --------------------------------------------------------
+        # Use rounding to avoid float noise; keep <NA> stable
+        sig = (
+            df_output[year_cols]
+            .astype('Float64')
+            .round(12)
+            .astype('string')
+            .fillna('<NA>')
+            .agg('|'.join, axis=1)
+        )
+        df_output['__sig'] = sig
+
+        # --------------------------------------------------------
+        # 1) Drop identical series within the same (model,scenario,region,variable,unit)
+        #    Keep exactly one representative row per signature.
+        # --------------------------------------------------------
+        before = len(df_output)
+        df_output = df_output.sort_values(series_cols + ['file_location', 'file_name']).copy()
+        df_output = df_output.drop_duplicates(subset=series_cols + ['__sig'], keep='first')
+        after = len(df_output)
+
+        if before != after:
+            msg = f"[Check] Dropped {before-after} file-rows with identical time series (kept one representative)."
+            print(Fore.GREEN + msg + Style.RESET_ALL)
+            error_log.append(msg)
+
+        print(f"[DEBUG] Identical time series dropped: {before-after:,} (kept one representative per signature)")
+
+        # --------------------------------------------------------
+        # 2) Conflicts: series that still have >1 distinct signature
+        #    => these are true duplicates you want to review
+        # --------------------------------------------------------
+        n_sigs = df_output.groupby(series_cols)['__sig'].transform('nunique')
+        conflict_mask = n_sigs > 1
+
+        # duplicates sheet = only conflicts (with file columns + full series)
         df_dups_output = None
-        if has_dup_region:
-            df_dups = df_model_combined.loc[dupe_mask].copy()
+        if conflict_mask.any():
+            df_dups_output = df_output.loc[conflict_mask].drop(columns=['__sig']).copy()
 
-            # same pivot structure as the main output when duplicates exist
-            df_dups_output = (
-                df_dups
-                .pivot(
-                    index=['model', 'scenario', 'region', 'variable', 'unit',
-                        'file_location', 'file_name'],
-                    columns='year',
-                    values='value'
-                )
-                .reset_index()
+            # rename region for conflicts to dup_<region>_<n>
+            df_output.loc[conflict_mask, '__dup_i'] = (
+                df_output.loc[conflict_mask]
+                .groupby(series_cols)
+                .cumcount()
+                .add(1)
             )
-            df_dups_output.columns = [str(col) for col in df_dups_output.columns]
 
+            df_output.loc[conflict_mask, 'region'] = (
+                'dup_' + df_output.loc[conflict_mask, 'region'].astype('string') + '_' +
+                df_output.loc[conflict_mask, '__dup_i'].astype('Int64').astype('string')
+            )
+
+            df_output.drop(columns=['__dup_i'], inplace=True, errors='ignore')
+
+
+        n_conflict_rows = int(conflict_mask.sum())
+        n_conflict_series = int(df_output.loc[conflict_mask, series_cols].drop_duplicates().shape[0]) if n_conflict_rows else 0
+        print(f"[DEBUG] True conflicts: {n_conflict_series:,} series, {n_conflict_rows:,} rows")
+
+        print(f"[DEBUG] df_dups_output: {'EMPTY/None' if (df_dups_output is None or df_dups_output.empty) else f'rows={len(df_dups_output):,}, cols={df_dups_output.shape[1]}'}")
+        
+        # cleanup
+        df_output.drop(columns=['__sig'], inplace=True, errors='ignore')
 
         out_file = os.path.join(OUTPUT_FOLDER, f"pyam_{model_key}.xlsx")
         # os.makedirs(os.path.dirname(out_file), exist_ok=True)
         # df_output.to_excel(out_file, index=False, sheet_name='pyam_data')
         
+        # If there are no true conflicts, drop source columns from the main data sheet
+        if not conflict_mask.any():
+            df_output.drop(columns=['file_location', 'file_name'], inplace=True, errors='ignore')
+    
         for i in range(0, 26):
             candidate = out_file if i == 0 else _next_copy_path(out_file, i)
             try:
@@ -1023,11 +1080,11 @@ for model_raw, model_group in model_groups:
                 break
             except PermissionError:
                 continue
-
+            
         if final_out_file is None:
             raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
 
-        output_msg_dups = "(with duplicates marked)" if has_dup_region else ""
+        output_msg_dups = "(with duplicates marked)" if conflict_mask.any() else ""
         print(Fore.GREEN + f"✅ Saved combined {output_msg_dups} file for model: {model_key} as {final_out_file}" + Style.RESET_ALL)
 
     except Exception as e:
