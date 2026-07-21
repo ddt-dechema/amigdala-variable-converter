@@ -998,6 +998,9 @@ for model_raw, model_group in model_groups:
         # set final unit to desired_unit where available
         df_input.loc[has_des, 'unit'] = df_input.loc[has_des, 'desired_unit']
        
+       # actual calculation into desired unit (if conversion_factor is NaN, it will be filled with 1 to avoid NaN propagation)
+        df_input['value'] = df_input['value'] * df_input['conversion_factor'].fillna(1)
+
         # optional cleanup
         df_input.drop(columns=['desired_unit'], inplace=True, errors='ignore')
 
