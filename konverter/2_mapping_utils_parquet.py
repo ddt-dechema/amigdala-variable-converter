@@ -454,33 +454,35 @@ def build_concat_expr(cols):
     return " || '|' || ".join(parts)
 
 EXCEL_MAX_ROWS = 1_048_576
-def pack_scenarios(rows_per_scenario: pd.Series, max_rows: int):
-    """
-    rows_per_scenario: Series index=scenario, values=rowcount (already sorted in desired order)
-    Returns: list[list[scenario]] bins where sum(rows) <= max_rows
-    Raises if a single scenario exceeds max_rows.
-    """
-    bins = []
-    current = []
-    current_rows = 0
+# def pack_scenarios(rows_per_scenario: pd.Series, max_rows: int):
+#     """
+#     rows_per_scenario: Series index=scenario, values=rowcount (already sorted in desired order)
+#     Returns: list[list[scenario]] bins where sum(rows) <= max_rows
+#     Raises if a single scenario exceeds max_rows.
+#     """
+#     bins = []
+#     current = []
+#     current_rows = 0
 
-    for scen, n in rows_per_scenario.items():
-        n = int(n)
-        if n > max_rows:
-            raise ValueError(f"Scenario '{scen}' has {n:,} rows which exceeds Excel limit per file ({max_rows:,}).")
+#     for scen, n in rows_per_scenario.items():
+#         n = int(n)
+#         if n > max_rows:
+#             raise ValueError(f"Scenario '{scen}' has {n:,} rows which exceeds Excel limit per file ({max_rows:,}).")
 
-        if current and (current_rows + n > max_rows):
-            bins.append(current)
-            current = []
-            current_rows = 0
+#         if current and (current_rows + n > max_rows):
+#             bins.append(current)
+#             current = []
+#             current_rows = 0
 
-        current.append(scen)
-        current_rows += n
+#         current.append(scen)
+#         current_rows += n
 
-    if current:
-        bins.append(current)
+#     if current:
+#         bins.append(current)
 
-    return bins# ============================================================
+#     return bins
+# 
+# ============================================================
 # 1. Dictionary-Dateien laden
 # ============================================================
 
@@ -1135,7 +1137,9 @@ for model_raw, model_group in model_groups:
             )
 
             df_output.drop(columns=['__dup_i'], inplace=True, errors='ignore')
-
+        else:
+            df_output = df_output.drop('file_location', axis=1)
+            df_output = df_output.drop('file_name', axis=1)
 
         n_conflict_rows = int(conflict_mask.sum())
         n_conflict_series = int(df_output.loc[conflict_mask, series_cols].drop_duplicates().shape[0]) if n_conflict_rows else 0
@@ -1148,31 +1152,7 @@ for model_raw, model_group in model_groups:
         # cleanup
         df_output.drop(columns=['__sig'], inplace=True, errors='ignore')
 
-        # for i in range(0, 26):
-        #     candidate = out_file if i == 0 else _next_copy_path(out_file, i)
-        #     try:
-        #         os.makedirs(os.path.dirname(out_file), exist_ok=True)
-        #         # df_output.to_excel(candidate, index=False, sheet_name='pyam_data')
-                
-        #         # with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
-        #         #     df_output.to_excel(writer, index=False, sheet_name="data") # renamed from 'pyam_data' to 'data' to pass upload
 
-        #         #     # write duplicates sheet only if it exists
-        #         #     if df_dups_output is not None and not df_dups_output.empty:
-        #         #         df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
-        #         with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
-        #             df_output.to_excel(writer, index=False, sheet_name="data")
-        #             if df_dups_output is not None and not df_dups_output.empty:
-        #                 df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
-        #         final_out_file = candidate
-        #         if i > 0:
-        #             msg = f"\n[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
-        #             print(Fore.YELLOW + msg + Style.RESET_ALL)
-        #             error_log.append(msg)
-        #         break
-        #     except PermissionError:
-        #         continue
-        
         # --------------------------------------------------------
         # It is possible that models create very large files (e.g. CITS)
         # Then, the Excel limit of 1,048,576 rows is exceeded. 
@@ -1181,81 +1161,82 @@ for model_raw, model_group in model_groups:
         # Split into multiple Excel files if Excel row limit is exceeded
         # (Option A: pack scenarios into as few files as possible)
         # --------------------------------------------------------
-        ROW_MARGIN = 10_000  # safety buffer for header/edge cases
-        max_rows_per_file = EXCEL_MAX_ROWS - ROW_MARGIN
+        # CURRENTLY NOT WORKING
+        # --------------------------------------------------------
+        # ROW_MARGIN = 10_000  # safety buffer for header/edge cases
+        # max_rows_per_file = EXCEL_MAX_ROWS - ROW_MARGIN
 
-        total_rows = len(df_output)
+        # total_rows = len(df_output)
 
-        # Build list of (suffix, dataframe_part)
-        parts = []
+        # # Build list of (suffix, dataframe_part)
+        # parts = []
 
-        if total_rows <= EXCEL_MAX_ROWS:
-            parts = [("", df_output)]
-        else:
-            # rows per scenario, sorted desc for best packing (fewer files)
-            rows_per_scen = (
-                df_output.groupby("scenario", dropna=False)
-                .size()
-                .sort_values(ascending=False)
-            )
+        # if total_rows <= EXCEL_MAX_ROWS:
+        #     parts = [("", df_output)]
+        # else:
+        #     # rows per scenario, sorted desc for best packing (fewer files)
+        #     rows_per_scen = (
+        #         df_output.groupby("scenario", dropna=False)
+        #         .size()
+        #         .sort_values(ascending=False)
+        #     )
 
-            scenario_bins = pack_scenarios(rows_per_scen, max_rows=max_rows_per_file)
+        #     scenario_bins = pack_scenarios(rows_per_scen, max_rows=max_rows_per_file)
 
-            # suffix naming: scen01-05, scen06-10, ... based on scenario count in packing order
-            scen_counter = 0
-            for bin_scenarios in scenario_bins:
-                start = scen_counter + 1
-                scen_counter += len(bin_scenarios)
-                end = scen_counter
+        #     # suffix naming: scen01-05, scen06-10, ... based on scenario count in packing order
+        #     scen_counter = 0
+        #     for bin_scenarios in scenario_bins:
+        #         start = scen_counter + 1
+        #         scen_counter += len(bin_scenarios)
+        #         end = scen_counter
 
-                suffix = f"scen{start:02d}-{end:02d}"
-                df_part = df_output[df_output["scenario"].isin(bin_scenarios)].copy()
-                parts.append((suffix, df_part))
+        #         suffix = f"scen{start:02d}-{end:02d}"
+        #         df_part = df_output[df_output["scenario"].isin(bin_scenarios)].copy()
+        #         parts.append((suffix, df_part))
 
-            msg = f"[Save] Output exceeds Excel row limit ({total_rows:,} rows). Writing {len(parts)} files grouped by scenario."
-            print(Fore.YELLOW + msg + Style.RESET_ALL)
-            error_log.append(msg)
+        #     msg = f"[Save] Output exceeds Excel row limit ({total_rows:,} rows). Writing {len(parts)} files grouped by scenario."
+        #     print(Fore.YELLOW + msg + Style.RESET_ALL)
+        #     error_log.append(msg)
+        
         
         # If there are no true conflicts, drop source columns from the main data sheet (for every part)
-        KEEP_SOURCE_COLS = True  # set False for final export after dedup
-        if (not KEEP_SOURCE_COLS) and (not conflict_mask.any()):
-            parts = [(suffix, df_part.drop(columns=['file_location','file_name'], errors='ignore'))
-                    for suffix, df_part in parts]
+        # KEEP_SOURCE_COLS = True  # set False for final export after dedup
+        # if (not KEEP_SOURCE_COLS) and (not conflict_mask.any()):
+        #     parts = [(suffix, df_part.drop(columns=['file_location','file_name'], errors='ignore'))
+        #             for suffix, df_part in parts]
                 
-        out_base = os.path.join(OUTPUT_FOLDER, f"pyam_{model_key}")
+        out_file = os.path.join(OUTPUT_FOLDER, f"pyam_{model_key}.xlsx")
 
-        for suffix, df_part in parts:
-            out_file = out_base + ("" if suffix == "" else f"_{suffix}") + ".xlsx"
 
-            final_out_file = None
-            for i in range(0, 26):
-                candidate = out_file if i == 0 else _next_copy_path(out_file, i)
-                try:
-                    os.makedirs(os.path.dirname(out_file), exist_ok=True)
+        for i in range(0, 26):
+            candidate = out_file if i == 0 else _next_copy_path(out_file, i)
+            try:
+                os.makedirs(os.path.dirname(out_file), exist_ok=True)
+                # df_output.to_excel(candidate, index=False, sheet_name='pyam_data')
+                
+                # with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
+                #     df_output.to_excel(writer, index=False, sheet_name="data") # renamed from 'pyam_data' to 'data' to pass upload
 
-                    with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
-                        df_part.to_excel(writer, index=False, sheet_name="data")
+                #     # write duplicates sheet only if it exists
+                #     if df_dups_output is not None and not df_dups_output.empty:
+                #         df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
+                with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
+                    df_output.to_excel(writer, index=False, sheet_name="data")
+                    if df_dups_output is not None and not df_dups_output.empty:
+                        df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
+                final_out_file = candidate
+                if i > 0:
+                    msg = f"\n[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
+                    print(Fore.YELLOW + msg + Style.RESET_ALL)
+                    error_log.append(msg)
+                break
+            except PermissionError:
+                continue
+        
+        if final_out_file is None:
+            raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
 
-                        # duplicates sheet only if it exists (optional: you can also split it later)
-                        if df_dups_output is not None and not df_dups_output.empty:
-                            # For now: write duplicates ONLY when not splitting, or if you want you can split it similarly by scenario.
-                            # Simplest behavior: only write duplicates when not split:
-                            if suffix == "":
-                                df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
-
-                    final_out_file = candidate
-                    if i > 0:
-                        msg = f"[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
-                        print(Fore.YELLOW + msg + Style.RESET_ALL)
-                        error_log.append(msg)
-                    break
-                except PermissionError:
-                    continue
-
-            if final_out_file is None:
-                raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
-
-            print(Fore.GREEN + f"✅ Saved file for model {model_key}: {final_out_file}" + Style.RESET_ALL)
+        print(Fore.GREEN + f"✅ Saved file for model {model_key}: {final_out_file}" + Style.RESET_ALL)
 
     except Exception as e:
         msg = f"ERROR during pivot/save for model {model_key}: {e}"
