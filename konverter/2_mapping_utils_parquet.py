@@ -3,6 +3,9 @@ import pandas as pd
 import pyarrow.parquet as pq
 import pyarrow.dataset as ds
 import duckdb
+# to cache dictionary file
+import pickle 
+import tempfile
 
 import os, sys, time, gc
 from pathlib import Path
@@ -453,58 +456,122 @@ def build_concat_expr(cols):
     parts = [f"COALESCE(CAST({q_ident(c)} AS VARCHAR), '')" for c in cols]
     return " || '|' || ".join(parts)
 
+# EXCEL_MAX_ROWS = 1_048_576
 EXCEL_MAX_ROWS = 1_048_576
-# def pack_scenarios(rows_per_scenario: pd.Series, max_rows: int):
-#     """
-#     rows_per_scenario: Series index=scenario, values=rowcount (already sorted in desired order)
-#     Returns: list[list[scenario]] bins where sum(rows) <= max_rows
-#     Raises if a single scenario exceeds max_rows.
-#     """
-#     bins = []
-#     current = []
-#     current_rows = 0
 
-#     for scen, n in rows_per_scenario.items():
-#         n = int(n)
-#         if n > max_rows:
-#             raise ValueError(f"Scenario '{scen}' has {n:,} rows which exceeds Excel limit per file ({max_rows:,}).")
+def pack_scenarios(rows_per_scenario: pd.Series, max_rows: int):
+    """
+    rows_per_scenario: Series index=scenario, values=rowcount (already sorted in desired order)
+    Returns: list[list[scenario]] bins where sum(rows) <= max_rows
+    Raises if a single scenario exceeds max_rows.
+    """
+    bins = []
+    current = []
+    current_rows = 0
 
-#         if current and (current_rows + n > max_rows):
-#             bins.append(current)
-#             current = []
-#             current_rows = 0
+    for scen, n in rows_per_scenario.items():
+        n = int(n)
+        if n > max_rows:
+            raise ValueError(f"Scenario '{scen}' has {n:,} rows which exceeds Excel limit per file ({max_rows:,}).")
 
-#         current.append(scen)
-#         current_rows += n
+        if current and (current_rows + n > max_rows):
+            bins.append(current)
+            current = []
+            current_rows = 0
 
-#     if current:
-#         bins.append(current)
+        current.append(scen)
+        current_rows += n
 
-#     return bins
-# 
+    if current:
+        bins.append(current)
+
+    return bins
+
+def _cache_is_valid(cache_path: str, source_path: str) -> bool:
+    if not os.path.exists(cache_path):
+        return False
+    try:
+        return os.path.getmtime(cache_path) >= os.path.getmtime(source_path)
+    except OSError:
+        return False
+
+
+def _atomic_pickle_dump(obj, path: str):
+    # write to temp file then replace (avoids corrupt cache if program crashes)
+    d = os.path.dirname(path) or "."
+    os.makedirs(d, exist_ok=True)
+
+    fd, tmp_path = tempfile.mkstemp(prefix="dict_cache_", suffix=".pkl", dir=d)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            pickle.dump(obj, f, protocol=pickle.HIGHEST_PROTOCOL)
+        os.replace(tmp_path, path)
+    finally:
+        try:
+            if os.path.exists(tmp_path):
+                os.remove(tmp_path)
+        except OSError:
+            pass
+        
 # ============================================================
 # 1. Dictionary-Dateien laden
 # ============================================================
 
 print(f"Loading dictionary from: {DICTIONARY_FILE_PATH}")
 
-dict_variable = load_mapping_dict(DICTIONARY_FILE_PATH, 'variables', 'names mapping', 'DE variable name')
-dict_model    = load_mapping_dict(DICTIONARY_FILE_PATH, 'models', 'source_models', 'target_models')
-dict_scenario = load_mapping_dict(DICTIONARY_FILE_PATH, 'scenarios', 'source_scenario', 'target_scenario')
+DICT_CACHE_PATH = os.path.join(OUTPUT_FOLDER, "dictionary_cache.pkl")
 
-# NEW: variable -> target unit (from variables-sheet)
-var_to_target_unit = load_variable_target_units(DICTIONARY_FILE_PATH, 'variables', 'DE variable name', 'unit')
-unit_pair_to_factor = load_unit_pair_to_factor(DICTIONARY_FILE_PATH, sheet="units")
+t_dict = time.time()
 
-# new - stricter loading of regions to catch duplicates and mapping issues early (since regions are often the main source of headaches in such mappings)
-countries_map, regions_map_by_model, region_conflicts, df_region_dict = load_region_mapping_model_aware(
-    DICTIONARY_FILE_PATH,
-    sheet="regions",
-    src_col="source_region",
-    tgt_col="target_region",
-    folder_col="folder",
-    model_sep="|"
-)
+if _cache_is_valid(DICT_CACHE_PATH, DICTIONARY_FILE_PATH):
+    print(f"[Cache] Loading dictionary cache: {DICT_CACHE_PATH}")
+    with open(DICT_CACHE_PATH, "rb") as f:
+        cached = pickle.load(f)
+
+    dict_variable = cached["dict_variable"]
+    dict_model = cached["dict_model"]
+    dict_scenario = cached["dict_scenario"]
+    var_to_target_unit = cached["var_to_target_unit"]
+    unit_pair_to_factor = cached["unit_pair_to_factor"]
+    countries_map = cached["countries_map"]
+    regions_map_by_model = cached["regions_map_by_model"]
+    region_conflicts = cached["region_conflicts"]
+else:
+    print(f"[Cache] Dictionary cache not found or outdated. Loading from source Excel.")
+    
+    dict_variable = load_mapping_dict(DICTIONARY_FILE_PATH, 'variables', 'names mapping', 'DE variable name')
+    dict_model    = load_mapping_dict(DICTIONARY_FILE_PATH, 'models', 'source_models', 'target_models')
+    dict_scenario = load_mapping_dict(DICTIONARY_FILE_PATH, 'scenarios', 'source_scenario', 'target_scenario')
+
+    # NEW: variable -> target unit (from variables-sheet)
+    var_to_target_unit = load_variable_target_units(DICTIONARY_FILE_PATH, 'variables', 'DE variable name', 'unit')
+    unit_pair_to_factor = load_unit_pair_to_factor(DICTIONARY_FILE_PATH, sheet="units")
+
+    # new - stricter loading of regions to catch duplicates and mapping issues early (since regions are often the main source of headaches in such mappings)
+    countries_map, regions_map_by_model, region_conflicts, df_region_dict  = load_region_mapping_model_aware(
+        DICTIONARY_FILE_PATH,
+        sheet="regions",
+        src_col="source_region",
+        tgt_col="target_region",
+        folder_col="folder",
+        model_sep="|"
+    )
+    
+    # save cache
+    cache_obj = {
+        "dict_variable": dict_variable,
+        "dict_model": dict_model,
+        "dict_scenario": dict_scenario,
+        "var_to_target_unit": var_to_target_unit,
+        "unit_pair_to_factor": unit_pair_to_factor,
+        "countries_map": countries_map,
+        "regions_map_by_model": regions_map_by_model,
+        "region_conflicts": region_conflicts,
+    }
+    _atomic_pickle_dump(cache_obj, DICT_CACHE_PATH)
+    print(f"[Cache] Wrote dictionary cache: {DICT_CACHE_PATH}")
+
+print(f"[TIMING] dictionary load took {time.time()-t_dict:.2f}s")
 
 # --- NEW: report region dictionary conflicts early (and fail if you want)
 if region_conflicts.get("countries_ambiguous"):
@@ -537,7 +604,7 @@ print(f"{len(regions_map_by_model)} model-specific region mappings loaded (uniqu
 # 2. Mapping-Datei laden
 # ============================================================
 
-print(f"Reading dictionary file: {MAPPING_FILE_PATH}")
+print(f"\n Reading files to process: {MAPPING_FILE_PATH}")
 try:
     df_mapping_full = pd.read_excel(MAPPING_FILE_PATH, sheet_name='files').fillna('')
     FIRST_MAPPING_SHEET_NAME = pd.ExcelFile(MAPPING_FILE_PATH).sheet_names[0]
@@ -693,7 +760,7 @@ for model_raw, model_group in model_groups:
             error_log.append(msg)
             continue
         
-        print(f"[TIMING] read took {time.time()-t:.2f}s")
+        # print(f"[TIMING] read took {time.time()-t:.2f}s")
         # ----------------------------------------------------
         # Also process files which are already in the IAMC format
         # ----------------------------------------------------
@@ -731,7 +798,7 @@ for model_raw, model_group in model_groups:
         found_cols = [c for c in ["scenario", "region", "year", "value", "unit"] if c in df_input.columns]
             
         print(f"Standardized columns: {found_cols}")
-        print("[TIMING] alias", time.time()-t); t=time.time()
+        # print(f"[TIMING] alias {time.time() - t:.2f}s"); t=time.time()
 
         # ----------------------------------------------------
         # Variable column preparation
@@ -750,7 +817,7 @@ for model_raw, model_group in model_groups:
         else:        
             print("[DEBUG] original_variable already present; skipping build.")
             pass
-        print("[TIMING] origvar", time.time()-t); t=time.time()
+        # print(f"[TIMING] origvar {time.time() - t:.2f}s"); t=time.time()
 
         # ----------------------------------------------------
         # Detect and handle IAMC/pyam wide-format files
@@ -1017,7 +1084,8 @@ for model_raw, model_group in model_groups:
         # ----------------------------------------------------
         # Transformation to IAMC format
         # ----------------------------------------------------
-        print("Transforming to IAMC-format ...")
+        print(Fore.MAGENTA + Style.BRIGHT + f"\n--- Transforming to IAMC format ---" + Style.RESET_ALL)
+        
         data_for_iamc = {
             'scenario': df_input['scenario'],
             'region':   df_input['region'],
@@ -1048,195 +1116,142 @@ for model_raw, model_group in model_groups:
 
     df_model_combined = pd.concat(df_model_all, ignore_index=True, copy=False)
 
-    print("[TIMING] mapping+conv", time.time()-t); t=time.time()
+    # print(f"[TIMING] mapping+conv {time.time()-t:.2f}s"); t=time.time()
 
     # --------------------------------------------------------
     # 4.x Pivot & save (save even with renamed duplicates)
     # --------------------------------------------------------
     
     try:
-        final_out_file = None
-        
+        final_out_file = None        
         # --------------------------------------------------------
-        # Pivot: always one row per file (full time series)
+        # NEW: Split BEFORE pivot to avoid RAM blow-ups
         # --------------------------------------------------------
         idx_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'file_location', 'file_name']
         series_cols = ['model', 'scenario', 'region', 'variable', 'unit']
+        series_key_cols = ['model', 'scenario', 'region', 'variable', 'unit', 'file_location', 'file_name']
 
-        df_output = (
+        ROW_MARGIN = 10  # for tests; for real runs use e.g. 10_000
+        max_rows_per_file = EXCEL_MAX_ROWS - ROW_MARGIN
+
+        # Estimate pivot rows per scenario (one row per unique series)
+        rows_per_scen = (
             df_model_combined
-            .pivot_table(
-                index=idx_cols,
-                columns='year',
-                values='value',
-                aggfunc='first'   # robust if same (idx,year) appears twice
-            )
-            .reset_index()
+            .drop_duplicates(subset=series_key_cols)
+            .groupby('scenario', dropna=False)
+            .size()
+            .sort_values(ascending=False)  # fewer files
         )
-
-        print(f"[DEBUG] After pivot: df_output rows={len(df_output):,} (one row per file/series)")
-
-        # normalize column names to strings
-        df_output.columns = [str(c) for c in df_output.columns]
-
-        # year columns (after pivot)
-        year_cols = [c for c in df_output.columns if c.isdigit()]
-
-        # --------------------------------------------------------
-        # Build time-series signature per row (for "identical series" detection)
-        # --------------------------------------------------------
-        # Use rounding to avoid float noise; keep <NA> stable
-        sig = (
-            df_output[year_cols]
-            .astype('Float64')
-            .round(12)
-            .astype('string')
-            .fillna('<NA>')
-            .agg('|'.join, axis=1)
-        )
-        df_output['__sig'] = sig
-
-        # --------------------------------------------------------
-        # 1) Drop identical series within the same (model,scenario,region,variable,unit)
-        #    Keep exactly one representative row per signature.
-        # --------------------------------------------------------
-        before = len(df_output)
-        df_output = df_output.sort_values(series_cols + ['file_location', 'file_name']).copy()
-        df_output = df_output.drop_duplicates(subset=series_cols + ['__sig'], keep='first')
-        after = len(df_output)
-
-        if before != after:
-            msg = f"[Check] Dropped {before-after} file-rows with identical time series (kept one representative)."
-            print(Fore.GREEN + msg + Style.RESET_ALL)
-            error_log.append(msg)
-            print(f"[DEBUG] Identical time series dropped: {before-after:,} (kept one representative per signature)")
-
-        # --------------------------------------------------------
-        # 2) Conflicts: series that still have >1 distinct signature
-        #    => these are true duplicates you want to review
-        # --------------------------------------------------------
-        n_sigs = df_output.groupby(series_cols)['__sig'].transform('nunique')
-        conflict_mask = n_sigs > 1
-
-        # duplicates sheet = only conflicts (with file columns + full series)
-        df_dups_output = None
-        if conflict_mask.any():
-            df_dups_output = df_output.loc[conflict_mask].drop(columns=['__sig']).copy()
-
-            # rename region for conflicts to dup_<region>_<n>
-            df_output.loc[conflict_mask, '__dup_i'] = (
-                df_output.loc[conflict_mask]
-                .groupby(series_cols)
-                .cumcount()
-                .add(1)
-            )
-
-            df_output.loc[conflict_mask, 'region'] = (
-                'dup_' + df_output.loc[conflict_mask, 'region'].astype('string') + '_' +
-                df_output.loc[conflict_mask, '__dup_i'].astype('Int64').astype('string')
-            )
-
-            df_output.drop(columns=['__dup_i'], inplace=True, errors='ignore')
+        
+        total_pivot_rows_est = int(rows_per_scen.sum())
+        print(f"[DEBUG] estimated pivot rows total: {total_pivot_rows_est:,} (limit per file: {max_rows_per_file:,})")
+        print(f"[DEBUG] scenarios count: {len(rows_per_scen):,}")
+        
+        if total_pivot_rows_est <= max_rows_per_file:
+            scenario_bins = [rows_per_scen.index.tolist()]  # <- wichtig: extra [ ... ]
         else:
-            df_output = df_output.drop('file_location', axis=1)
-            df_output = df_output.drop('file_name', axis=1)
+            scenario_bins = pack_scenarios(rows_per_scen, max_rows=max_rows_per_file)
+            if len(scenario_bins) > 1:
+                print(Fore.YELLOW + f"[Save] Writing {len(scenario_bins)} file(s) due to Excel row limit (test limit={EXCEL_MAX_ROWS:,})." + Style.RESET_ALL)
+                error_log.append(f"[Save] Split into {len(scenario_bins)} files by scenario bins due to Excel row limit.")
+        # name bins as _scen_1, _scen_2, ... (your requested naming)
+        out_base = os.path.join(OUTPUT_FOLDER, f"pyam_{model_key}")
 
-        n_conflict_rows = int(conflict_mask.sum())
-        n_conflict_series = int(df_output.loc[conflict_mask, series_cols].drop_duplicates().shape[0]) if n_conflict_rows else 0
-        if not df_dups_output is None and not df_dups_output.empty:
-            print("[DEBUG] There are duplicates; writing to separate sheet in output file.")        
-        if (n_conflict_rows > 0):
-            print(f"[DEBUG] True conflicts: {n_conflict_series:,} series, {n_conflict_rows:,} rows")
+        for bin_i, scen_list in enumerate(scenario_bins, start=1):
+            df_long_part = df_model_combined[df_model_combined['scenario'].isin(scen_list)].copy()
 
+            # ---- Pivot only this part ----
+            df_output = (
+                df_long_part
+                .pivot_table(index=idx_cols, columns='year', values='value', aggfunc='first')
+                .reset_index()
+            )
+            df_output.columns = [str(c) for c in df_output.columns]
+
+            print(f"[DEBUG] Part {bin_i}: scenarios={len(scen_list)}, df_output rows={len(df_output):,}")
+
+            # ---- Duplicate/conflict logic on df_output (same as your current code) ----
+            year_cols = [c for c in df_output.columns if c.isdigit()]
+
+            sig = (
+                df_output[year_cols]
+                .astype('Float64')
+                .round(12)
+                .astype('string')
+                .fillna('<NA>')
+                .agg('|'.join, axis=1)
+            )
+            df_output['__sig'] = sig
+
+            before = len(df_output)
+            df_output = df_output.sort_values(series_cols + ['file_location', 'file_name']).copy()
+            df_output = df_output.drop_duplicates(subset=series_cols + ['__sig'], keep='first')
+            after = len(df_output)
+
+            if before != after:
+                msg = f"[Check] Dropped {before-after} identical time series rows in part {bin_i}."
+                print(Fore.GREEN + msg + Style.RESET_ALL)
+                error_log.append(msg)
+
+            n_sigs = df_output.groupby(series_cols)['__sig'].transform('nunique')
+            conflict_mask = n_sigs > 1
+
+            df_dups_output = None
+            if conflict_mask.any():
+                df_dups_output = df_output.loc[conflict_mask].drop(columns=['__sig']).copy()
+
+                df_output.loc[conflict_mask, '__dup_i'] = (
+                    df_output.loc[conflict_mask]
+                    .groupby(series_cols)
+                    .cumcount()
+                    .add(1)
+                )
+                df_output.loc[conflict_mask, 'region'] = (
+                    'dup_' + df_output.loc[conflict_mask, 'region'].astype('string') + '_' +
+                    df_output.loc[conflict_mask, '__dup_i'].astype('Int64').astype('string')
+                )
+                df_output.drop(columns=['__dup_i'], inplace=True, errors='ignore')
+
+            # cleanup helper
+            df_output.drop(columns=['__sig'], inplace=True, errors='ignore')
+
+            # ---- Write this part ----
+            split_mode = len(scenario_bins) > 1
+            if split_mode:
+                out_file = out_base + f"_scen_{bin_i}.xlsx"
+            else:
+                out_file = out_base + ".xlsx"
+
+            final_out_file = None
+            for i in range(0, 26):
+                candidate = out_file if i == 0 else _next_copy_path(out_file, i)
+                try:
+                    os.makedirs(os.path.dirname(out_file), exist_ok=True)
+                    with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
+                        df_output.to_excel(writer, index=False, sheet_name="data")
+                        if df_dups_output is not None and not df_dups_output.empty:
+                            df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
+                    final_out_file = candidate
+                    if i > 0:
+                        msg = f"[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
+                        print(Fore.YELLOW + msg + Style.RESET_ALL)
+                        error_log.append(msg)
+                    break
+                except PermissionError:
+                    continue
             
-        # cleanup
-        df_output.drop(columns=['__sig'], inplace=True, errors='ignore')
+            # --------------------------------------------------------
+            # End of NEW
+            # --------------------------------------------------------
+            
+            if final_out_file is None:
+                raise PermissionError(f"Could not write output file (locked?) after retries: {out_file}")
 
+            print(Fore.GREEN + f"✅ Saved file for model {model_key}: {final_out_file}" + Style.RESET_ALL)
 
-        # --------------------------------------------------------
-        # It is possible that models create very large files (e.g. CITS)
-        # Then, the Excel limit of 1,048,576 rows is exceeded. 
-        # In that case, we need to split the output into multiple files.
-        # --------------------------------------------------------
-        # Split into multiple Excel files if Excel row limit is exceeded
-        # (Option A: pack scenarios into as few files as possible)
-        # --------------------------------------------------------
-        # CURRENTLY NOT WORKING
-        # --------------------------------------------------------
-        # ROW_MARGIN = 10_000  # safety buffer for header/edge cases
-        # max_rows_per_file = EXCEL_MAX_ROWS - ROW_MARGIN
-
-        # total_rows = len(df_output)
-
-        # # Build list of (suffix, dataframe_part)
-        # parts = []
-
-        # if total_rows <= EXCEL_MAX_ROWS:
-        #     parts = [("", df_output)]
-        # else:
-        #     # rows per scenario, sorted desc for best packing (fewer files)
-        #     rows_per_scen = (
-        #         df_output.groupby("scenario", dropna=False)
-        #         .size()
-        #         .sort_values(ascending=False)
-        #     )
-
-        #     scenario_bins = pack_scenarios(rows_per_scen, max_rows=max_rows_per_file)
-
-        #     # suffix naming: scen01-05, scen06-10, ... based on scenario count in packing order
-        #     scen_counter = 0
-        #     for bin_scenarios in scenario_bins:
-        #         start = scen_counter + 1
-        #         scen_counter += len(bin_scenarios)
-        #         end = scen_counter
-
-        #         suffix = f"scen{start:02d}-{end:02d}"
-        #         df_part = df_output[df_output["scenario"].isin(bin_scenarios)].copy()
-        #         parts.append((suffix, df_part))
-
-        #     msg = f"[Save] Output exceeds Excel row limit ({total_rows:,} rows). Writing {len(parts)} files grouped by scenario."
-        #     print(Fore.YELLOW + msg + Style.RESET_ALL)
-        #     error_log.append(msg)
-        
-        
-        # If there are no true conflicts, drop source columns from the main data sheet (for every part)
-        # KEEP_SOURCE_COLS = True  # set False for final export after dedup
-        # if (not KEEP_SOURCE_COLS) and (not conflict_mask.any()):
-        #     parts = [(suffix, df_part.drop(columns=['file_location','file_name'], errors='ignore'))
-        #             for suffix, df_part in parts]
-                
-        out_file = os.path.join(OUTPUT_FOLDER, f"pyam_{model_key}.xlsx")
-
-
-        for i in range(0, 26):
-            candidate = out_file if i == 0 else _next_copy_path(out_file, i)
-            try:
-                os.makedirs(os.path.dirname(out_file), exist_ok=True)
-                # df_output.to_excel(candidate, index=False, sheet_name='pyam_data')
-                
-                # with pd.ExcelWriter(candidate, engine="openpyxl") as writer:
-                #     df_output.to_excel(writer, index=False, sheet_name="data") # renamed from 'pyam_data' to 'data' to pass upload
-
-                #     # write duplicates sheet only if it exists
-                #     if df_dups_output is not None and not df_dups_output.empty:
-                #         df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
-                with pd.ExcelWriter(candidate, engine="xlsxwriter") as writer:
-                    df_output.to_excel(writer, index=False, sheet_name="data")
-                    if df_dups_output is not None and not df_dups_output.empty:
-                        df_dups_output.to_excel(writer, index=False, sheet_name="duplicates")
-                final_out_file = candidate
-                if i > 0:
-                    msg = f"\n[Save] Output was open/locked; wrote to fallback file: {Path(candidate).name}"
-                    print(Fore.YELLOW + msg + Style.RESET_ALL)
-                    error_log.append(msg)
-                break
-            except PermissionError:
-                continue
-        
-        if final_out_file is None:
-            raise PermissionError(f"Could not write output file (file locked?) after retries: {out_file}")
-
-        print(Fore.GREEN + f"✅ Saved file for model {model_key}: {final_out_file}" + Style.RESET_ALL)
+            # free memory for next part
+            del df_long_part, df_output, df_dups_output
+            gc.collect()
 
     except Exception as e:
         msg = f"ERROR during pivot/save for model {model_key}: {e}"
@@ -1244,14 +1259,14 @@ for model_raw, model_group in model_groups:
         error_log.append(msg)
         continue
 
-    # Clean up memory
-    del df_output, df_model_all, df_model_combined
-    gc.collect()
+    # # Clean up memory
+    # del df_output, df_model_all, df_model_combined
+    # gc.collect()
 
     cur_time = time.time()
     print(f"\n⏱️ Runtime so far: {cur_time - start_time:.2f} Seconds\n")
     
-    print("[TIMING] pivot+save", time.time()-t)
+    # print("[TIMING] pivot+save", time.time()-t)
 
 # ============================================================
 # 5. Finalization & Logs
