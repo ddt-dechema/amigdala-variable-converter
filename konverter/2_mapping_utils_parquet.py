@@ -1211,6 +1211,9 @@ for model_raw, model_group in model_groups:
                     df_output.loc[conflict_mask, '__dup_i'].astype('Int64').astype('string')
                 )
                 df_output.drop(columns=['__dup_i'], inplace=True, errors='ignore')
+            else:
+                df_output = df_output.drop('file_location', axis=1)
+                df_output = df_output.drop('file_name', axis=1)
 
             # cleanup helper
             df_output.drop(columns=['__sig'], inplace=True, errors='ignore')
