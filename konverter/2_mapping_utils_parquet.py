@@ -571,7 +571,7 @@ else:
     _atomic_pickle_dump(cache_obj, DICT_CACHE_PATH)
     print(f"[Cache] Wrote dictionary cache: {DICT_CACHE_PATH}")
 
-print(f"[TIMING] dictionary load took {time.time()-t_dict:.2f}s")
+print(Fore.BLUE + f"[TIMING] ⏱️ Dictionary load took {time.time()-t_dict:.2f}s\n" + Style.RESET_ALL)
 
 # --- NEW: report region dictionary conflicts early (and fail if you want)
 if region_conflicts.get("countries_ambiguous"):
@@ -604,7 +604,7 @@ print(f"{len(regions_map_by_model)} model-specific region mappings loaded (uniqu
 # 2. Mapping-Datei laden
 # ============================================================
 
-print(f"\n Reading files to process: {MAPPING_FILE_PATH}")
+print(f"\nReading files to process: {MAPPING_FILE_PATH}")
 try:
     df_mapping_full = pd.read_excel(MAPPING_FILE_PATH, sheet_name='files').fillna('')
     FIRST_MAPPING_SHEET_NAME = pd.ExcelFile(MAPPING_FILE_PATH).sheet_names[0]
@@ -624,7 +624,7 @@ print(f"\n{len(grouped_mappings)} unique files for processing found.")
 # ============================================================
 cur_time = time.time()
 elapsed = cur_time - start_time
-print(f"\n⏱️ Runtime so far: {elapsed:.2f} Seconds\n")
+print(Fore.BLUE + f"\n[TIMINIG] ⏱️ Runtime so far: {elapsed:.2f} Seconds\n" + Style.RESET_ALL)
 
 # ============================================================
 # 4. Process all files grouped by model
@@ -632,7 +632,7 @@ print(f"\n⏱️ Runtime so far: {elapsed:.2f} Seconds\n")
 
 # Group only by model so all files of one model are collected together
 model_groups = df_mapping_full.groupby('Source model')
-print(f"\n{len(model_groups)} unique models for processing found.")
+print(f"{len(model_groups)} unique models for processing found.")
 
 for model_raw, model_group in model_groups:
     model_key = dict_model.get(model_raw, model_raw)
@@ -1084,6 +1084,8 @@ for model_raw, model_group in model_groups:
         # ----------------------------------------------------
         # Transformation to IAMC format
         # ----------------------------------------------------
+        cur_time = time.time()
+        print(Fore.BLUE + f"\n[TIMING] ⏱️ Runtime so far: {time.time()-t_dict:.2f}s" + Style.RESET_ALL)
         print(Fore.MAGENTA + Style.BRIGHT + f"\n--- Transforming to IAMC format ---" + Style.RESET_ALL)
         
         data_for_iamc = {
@@ -1267,8 +1269,8 @@ for model_raw, model_group in model_groups:
     # gc.collect()
 
     cur_time = time.time()
-    print(f"\n⏱️ Runtime so far: {cur_time - start_time:.2f} Seconds\n")
-    
+    print(Fore.BLUE + f"\n[TIMING] ⏱️ Runtime so far {time.time()-t_dict:.2f}s" + Style.RESET_ALL)
+
     # print("[TIMING] pivot+save", time.time()-t)
 
 # ============================================================
@@ -1287,4 +1289,4 @@ with open(os.path.join(OUTPUT_FOLDER,'error_log.txt'), "w", encoding="utf-8") as
 
 end_time = time.time()
 elapsed = end_time - start_time
-print(f"\n⏱️ Runtime of the script: {elapsed:.2f} Seconds\n")
+print(Fore.BLUE + f"\n[TIMING] ⏱️ Runtime of the script: {elapsed:.2f} Seconds\n" + Style.RESET_ALL)
